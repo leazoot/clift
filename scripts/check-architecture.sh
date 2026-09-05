@@ -238,7 +238,7 @@ fi
 
 # --- 10. the relay client never touches key material -------------------------
 
-printf '[10/11] the relay client cannot see a key\n'
+printf '[10/12] the relay client cannot see a key\n'
 # Universal Mode's entire security argument is that the relay holds ciphertext
 # it cannot read. The port signatures are what enforce that, and this is the
 # executable form: nothing in the relay client may name the key type, and no
@@ -262,7 +262,7 @@ else
     pass 'no token appears in the relay client or server'
 fi
 
-printf '[11/11] local paths and remote paths do not get mixed up\n'
+printf '[11/12] local paths and remote paths do not get mixed up\n'
 # RemotePath is POSIX by definition: the far side is POSIX even when Clift runs
 # on Windows, and its own documentation says local path semantics must never
 # leak into it. The staging layer that writes on *this* machine used it anyway,
@@ -277,6 +277,24 @@ if [ -n "$mixed" ]; then
     printf '%s\n' "$mixed" | sed 's/^/        /'
 else
     pass 'the local staging layer uses LocalPath, not RemotePath'
+fi
+
+printf '[12/12] a paste is delivered in one place\n'
+# Where the result of a paste goes -- stdout, the clipboard, or typed into the
+# focused window -- is one decision, and both modes have to make it the same
+# way. Fast Mode used to take a bare `copy` flag instead, so it had nowhere to
+# put `--inject` and printed instead; under the hotkey helper stdout is a log
+# file, and a press that could have typed did nothing anybody could see.
+# Typing is the half that has no other legitimate caller, so it is the half
+# this pins: one call site, in the function both modes route through.
+typists="$(grep -rn --include='*.rs' 'type_into_focused_window' crates/clift-cli/src \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+typist_files="$(printf '%s\n' "$typists" | cut -d: -f1 | sort -u)"
+if [ "$typist_files" != "crates/clift-cli/src/cmd/universal.rs" ]; then
+    fail 'keystroke delivery is called from somewhere other than the shared deliver()'
+    printf '%s\n' "$typists" | sed 's/^/        /'
+else
+    pass 'both modes deliver a paste through the same function'
 fi
 
 printf '\n'

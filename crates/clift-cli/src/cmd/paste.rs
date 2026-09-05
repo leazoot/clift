@@ -99,7 +99,13 @@ pub fn run(
                 reporter,
             )
         }
-        Mode::Fast => fast(&loaded.config, &resolved, to, copy, reporter),
+        Mode::Fast => fast(
+            &loaded.config,
+            &resolved,
+            to,
+            delivery(copy, inject),
+            reporter,
+        ),
     }
 }
 
@@ -177,7 +183,7 @@ fn fast(
     config: &Config,
     resolved: &Resolved,
     to: Option<&str>,
-    copy: bool,
+    delivery: Delivery,
     reporter: &Reporter,
 ) -> Result<(), CliftError> {
     let (name, target) = usecase::resolve_send_target(config, to)?;
@@ -221,21 +227,38 @@ fn fast(
         return reporter.machine(&value).map_err(stdout_failed);
     }
 
-    if copy {
-        // Only now, after the upload succeeded: replacing the clipboard and
-        // then failing would cost the user twice.
-        clift_clipboard::write_text(outcome.insertion_text())?;
-        reporter.success(&format!(
-            "Sent to {name}. The clipboard now holds the text to paste."
-        ));
-        return Ok(());
-    }
+    // Only now, after the upload succeeded: replacing the clipboard or typing
+    // and then failing would cost the user twice.
+    //
+    // Through the same function Universal Mode uses, because what a key press
+    // does with the result must not depend on which mode produced it. While
+    // this branch took a bare `copy` flag it had no way to honour `--inject`
+    // and silently printed instead, and the hotkey helper's stdout is a log
+    // file: on a machine that could type, a press in Fast Mode did nothing
+    // anybody could see.
+    universal::deliver(delivery, outcome.insertion_text())?;
 
-    // Without `--json` the insertion text is still the result, so a person can
-    // run `clift paste` by hand and see what the terminal would have typed.
-    reporter
-        .insertion_text(&format!("{}\n", outcome.insertion_text()))
-        .map_err(stdout_failed)
+    match delivery {
+        Delivery::Copy => {
+            reporter.success(&format!(
+                "Sent to {name}. The clipboard now holds the text to paste."
+            ));
+            Ok(())
+        }
+        Delivery::Inject => {
+            reporter.success(&format!(
+                "Sent to {name}. Typed into the focused window; your clipboard is untouched."
+            ));
+            Ok(())
+        }
+        // Without `--json` the insertion text is still the result, so a person
+        // can run `clift paste` by hand and see what the terminal would have
+        // typed. `Token` is not reachable here: it belongs to `clift copy`,
+        // which never runs Fast Mode.
+        Delivery::Print | Delivery::Token => reporter
+            .insertion_text(&format!("{}\n", outcome.insertion_text()))
+            .map_err(stdout_failed),
+    }
 }
 
 fn serialisation_failed(error: &serde_json::Error) -> CliftError {

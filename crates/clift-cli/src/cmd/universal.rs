@@ -163,7 +163,7 @@ pub fn send_it_over_ssh_instead() -> Remedy {
 /// Only `--copy` touches the clipboard. `--inject` types the token in, which
 /// is why nothing here has to put a screenshot back afterwards: the user's
 /// clipboard is never borrowed in the first place.
-fn deliver(delivery: Delivery, text: &str) -> Result<(), CliftError> {
+pub(crate) fn deliver(delivery: Delivery, text: &str) -> Result<(), CliftError> {
     match delivery {
         // Nothing to do yet: printing happens in `report`, on stdout, after
         // everything that could still fail has succeeded.
