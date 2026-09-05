@@ -24,7 +24,7 @@ jobs:
     name: fmt, clippy, test, release, boundaries
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml pins the exact version; rustup installs it on demand.
       - name: Show toolchain
@@ -57,7 +57,7 @@ jobs:
     name: MSRV 1.95
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # An explicit `+toolchain` overrides rust-toolchain.toml, which is how this
       # job escapes the pinned channel without editing the file.
@@ -78,7 +78,7 @@ jobs:
     # run is blocking instead, which keeps advisories from being ignored.
     continue-on-error: ${{ github.event_name != 'schedule' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
