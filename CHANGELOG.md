@@ -7,7 +7,17 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- In Fast Mode the key combination did nothing a person could see. Where
+  Universal Mode chooses between printing the result, putting it on the
+  clipboard and typing it into the focused window, Fast Mode took a bare "copy
+  or not" flag, so it had nowhere to put the third choice and printed instead.
+  Under the hotkey helper stdout is a log file, which is where the line went.
+  A press on a machine that could not type happened to work, because that
+  falls back to the clipboard; the machines that could type were the ones it
+  failed on. Both modes now make the choice through the same function, and a
+  build check keeps the typing call to a single site.
 
 ## [0.1.0] - 2026-09-04
 

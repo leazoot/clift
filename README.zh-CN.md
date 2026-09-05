@@ -24,28 +24,29 @@
 Clift 补上这一段:不碰你的 SSH 配置,服务器上不跑常驻进程,也不在乎你用哪个终端。
 
 ```console
-$ clift paste --copy            # 在笔记本上,截图之后
-Sealed 1 attachment (287 KiB). The instruction is on your clipboard.
+$ clift setup core              # 你 ~/.ssh/config 里的别名;检查 SSH 与 SFTP,然后记住它
+$ clift hotkey --install        # 一个组合键,注册为登录时启动
 
-$ # 在 SSH 会话里 Cmd+V,任何终端都行:
-Attachment: clift fetch 'clift://v1/…'
-
-$ # Agent 在服务器上执行它:
-/home/dev/.cache/clift/inbox/2026-09-02/2a07…/clipboard.png
+$ # 截图,在 SSH 会话里按下这个键,会话里出现这一行:
+Please inspect this file: '/home/dev/.cache/clift/inbox/2026-09-05/2a07…/clipboard.png'
 ```
+
+Agent 读这个路径。服务器上什么都没装,不经过任何 Relay,文件走的是你本来就有的 `ssh` 和 `sftp`。
 
 ## 两种用法
 
-| | **Universal Mode**(默认) | **Fast Mode** |
+| | **Fast Mode** | **Universal Mode** |
 | --- | --- | --- |
-| 发到哪台服务器? | 你把它粘进哪个会话,就是哪台 | 你事先配置的那台 |
-| 终端要求 | 能粘贴文本就行 | 任意:命令由你自己敲 |
-| 传输路径 | 本地加密,经一个只见密文的 Relay,再 `clift fetch` | 你自己的 SSH/SFTP,直连 |
-| 服务器上需要什么 | 同一个 `clift` 二进制,每次粘贴运行一次 | 什么都不需要 |
+| 适合 | 已经配好的一台服务器 | 任意多台,包括你没配置过的 |
+| 发到哪台? | 你配置的那台 | 你把 token 粘进哪个会话,就是哪台 |
+| 传输路径 | 你自己的 SSH 与 SFTP,直连 | 本地加密,经一个只见密文的 Relay,再 `clift fetch` |
+| 服务器上需要什么 | 什么都不需要 | 同一个 `clift` 二进制,每次粘贴运行一次 |
+| 第一次粘贴之前 | `clift setup <ssh-host>` | 同上,外加一个你自己跑或部署的 Relay |
 
-Universal Mode 适合有多台服务器的人,组合键走的也是它。Fast Mode 适合已经配好一台服务器、并且希望中间不经过任何第三方的人。
+两种模式由同一个组合键驱动,也都不碰纯文本。**先用 Fast Mode**:两条命令,不需要你本来没有的任何东西。
+等一台配好的主机不够用了再换 Universal Mode,那个时刻就是你不想再告诉 Clift「是哪台」的时刻。
 
-## 快速开始(Universal Mode)
+## 快速开始
 
 ### 1. 在笔记本上安装
 
@@ -62,14 +63,52 @@ PS> irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
 ```
 
 两个脚本都会把发布包连同它的 `SHA256SUMS` 一起下载,摘要不符就什么都不装,也不需要 sudo。
-装完后会接着启动 `clift setup`,问你几个问题:用哪种模式、Relay 的地址(保存之前先真实往返一次)、用哪个组合键粘贴。
-macOS 和 Windows 上,这个键背后的助手会注册为登录时启动,并且隐藏运行,不需要一直开着终端。随时可以再跑一次 `clift setup`。
+装完后会接着启动 `clift setup`,先问你用哪种模式,然后顺着往下问:Fast Mode 要一个 SSH 主机别名,
+Universal Mode 要一个 Relay 地址(保存之前先真实往返一次)。把问题答完,下面两步就已经做完了;
+命令写在这里,是为了让你看见它们做了什么。随时可以再跑一次 `clift setup`。
 
 其他安装方式:`brew install leazoot/clift/clift`、`cargo binstall --git https://github.com/leazoot/clift clift-cli`、
 [Releases](https://github.com/leazoot/clift/releases) 页面,或者用 Rust 1.95 及以上 `cargo build --release`。
 Scoop 清单在 [`packaging/`](packaging/)。加 `--no-setup`(或设置 `CLIFT_NO_SETUP=1`)可以只安装、不问问题。
 
-### 2. 准备一个 Relay
+### 2. 指定一台服务器
+
+```console
+$ clift setup core
+```
+
+`core` 是你自己 `~/.ssh/config` 里的别名。Clift 会先把解析出来的用户、主机、端口显示给你,
+等你确认,然后依次检查 SSH、检查 SFTP、创建一个私有 inbox、上传一个文件再删掉。
+**全部通过之前不会写入任何配置**,而第一台配好的主机自动成为默认目标。
+
+### 3. 注册组合键
+
+```console
+$ clift hotkey --install
+```
+
+macOS 和 Windows 上,助手注册为登录时启动并隐藏运行,不需要一直开着终端。
+macOS 第一次会弹窗要「辅助功能」权限,因为「往别的应用里打字」正是这个权限管的事。
+
+### 4. 粘贴
+
+截图,然后在正跟服务器对话的那个终端里按下这个键(macOS 默认 `Cmd+Shift+V`,其余平台 `Ctrl+Alt+V`)。
+一行字被打进会话:
+
+```text
+Please inspect this file: '/home/dev/.cache/clift/inbox/2026-09-05/2a07…/clipboard.png'
+```
+
+Agent 读它就行。**纯文本不受影响**:剪贴板里是文本时按这个键,终端照常粘贴。
+
+Fast Mode 到这里就全部讲完了。下面是「一台服务器不够用」的时候该怎么办。
+
+## 任意多台服务器:Universal Mode
+
+Fast Mode 发到你配置过的那台。Universal Mode 发到**你把 token 粘进的那个会话**所在的机器,
+也就是说你既不用告诉 Clift 是哪台,也根本不用配置那些机器。代价是一个 Relay,以及每台服务器装一次。
+
+### 1. 准备一个 Relay
 
 Relay 只保存加密后的附件几分钟,读不懂内容。可以用 `clift-relayd` 自己跑,也可以一键部署到免费的 Cloudflare 账户:
 
@@ -77,7 +116,7 @@ Relay 只保存加密后的附件几分钟,读不懂内容。可以用 `clift-re
 
 把地址交给笔记本上的 `clift setup`,或者之后用 `clift config set relay.url https://clift-relay.<you>.workers.dev` 设置。
 
-### 3. 配置每台服务器
+### 2. 配置每台服务器
 
 **推荐:让 Agent 自己来。** 将来接收截图的那个 Agent 可以自己把 Clift 装好、配好。把下面这段粘给它,Relay 地址换成你的:
 
@@ -108,7 +147,7 @@ $ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/a
 Claude Code 还可以再进一步:装一个 [hook](integrations/claude-code/README.md),你按回车的那一刻附件就取回到本地,Claude 直接读文件,不用先决定去跑命令。
 按你的 Agent 读哪个文件改成 `AGENTS.md`、`GEMINI.md` 等。Token 里带着对象和密钥,但从不带 Relay 的地址,所以每台服务器都要告诉它一次。
 
-### 4. 粘贴
+### 3. 粘贴
 
 截一张图,然后在正连着服务器的终端里按 setup 时选的组合键(没改的话 macOS 是 `Cmd+Shift+V`,Windows 是 `Ctrl+Alt+V`),
 或者运行 `clift paste --copy` 再粘贴。会话里会出现一行:
@@ -119,7 +158,7 @@ Attachment: clift fetch 'clift://v1/…'
 
 Agent 执行它,就拿到了文件。不用选目标,不用改 `ssh` 配置,不用装插件。
 
-### 5. 把东西带回来
+### 4. 把东西带回来
 
 同一个键也能反过来用。在服务器上点名一个文件:
 
@@ -133,7 +172,7 @@ clift://v1/…
 
 这是给「你所在的位置连不到那台服务器」准备的。连得到的时候 `scp` 更省事,Clift 也会这么告诉你。
 
-## 工作原理
+## Universal Mode 的工作原理
 
 ```text
  笔记本                          Relay                          服务器
@@ -150,17 +189,26 @@ clift://v1/…
 
 纯文本粘贴完全不受影响:该怎么粘还怎么粘。
 
-## Fast Mode
+## 和同类工具的区别
 
-一台服务器,你自己的 SSH,中间没有任何东西:
+解决同一个开头问题的工具有好几个,区别在于它们要你付出什么,以及走到哪一步为止。
 
-```console
-$ clift setup core                       # 检查 SSH 与 SFTP,创建 inbox,记住它
-$ clift send --clipboard --to core       # 打印要粘贴的路径
-```
+| | Clift | [clipssh](https://github.com/samuellawrentz/clipssh) | [clipaste](https://github.com/hqhq1025/clipaste) | [claude-ssh-image-skill](https://github.com/AlexZeitler/claude-ssh-image-skill) |
+| --- | --- | --- | --- | --- |
+| 监听剪贴板 | 否,按键时读一次 | 否 | **是**,常驻后台 | 否 |
+| 一次配置管几台 | Universal Mode 下任意多台,且无需配置 | 你配置的那台 | 你配置的那台 | 你配置的那台 |
+| 服务器上装什么 | Fast Mode 下什么都不装 | 不装 | 不装 | 一个客户端 |
+| 网络形态 | 你的 SSH,或一个只见密文的 Relay | 你的 SSH | 你的 SSH | 反向隧道回本地守护进程 |
+| 能把文件带回来 | 能,`clift copy` | 否 | 否 | 否 |
+| 绑定某个 Agent | 否 | 否 | 否 | Claude Code |
 
-文件走你已有的 `ssh` 和 `sftp`:同一份 `~/.ssh/config`、同一个 agent、同样的硬件密钥、同样的 `known_hosts`。
-Clift 从不削弱主机校验,也从不读私钥。
+**Clift 输在哪:** 如果你只有一台 Mac、一台服务器,并且只想要最短的安装过程,那么一个
+「监听剪贴板并把图片换成路径」的工具是一条 `brew install` 外加零配置,而 Clift 是两条命令。
+Universal Mode 还要你在第一次粘贴之前跑或部署一个 Relay,这是「不用说是哪台机器」的价钱。
+
+**赢在哪:** 没有任何东西在后台读你的剪贴板;Fast Mode 下服务器上什么都不装;
+真的经过 Relay 时附件是端到端加密的;文件不只能出去还能回来;
+并且它不知道也不关心你用的是哪个 Agent、哪个终端。
 
 ## 命令
 

@@ -25,30 +25,32 @@ nothing useful. Clift closes that gap without touching your SSH setup, without
 a daemon on the server, and without caring which terminal you use.
 
 ```console
-$ clift paste --copy            # on your laptop, after taking a screenshot
-Sealed 1 attachment (287 KiB). The instruction is on your clipboard.
+$ clift setup core              # your ~/.ssh/config alias; checks SSH and SFTP, then remembers it
+$ clift hotkey --install        # one key combination, registered at login
 
-$ # Cmd+V in the SSH session, in any terminal:
-Attachment: clift fetch 'clift://v1/…'
-
-$ # the agent runs it, on the server:
-/home/dev/.cache/clift/inbox/2026-09-02/2a07…/clipboard.png
+$ # take a screenshot, press the key in the SSH session, and this appears:
+Please inspect this file: '/home/dev/.cache/clift/inbox/2026-09-05/2a07…/clipboard.png'
 ```
+
+The agent reads the path. Nothing was installed on the server, no relay is
+involved, and the file went over the `ssh` and `sftp` you already have.
 
 ## Two ways to get there
 
-| | **Universal Mode** (default) | **Fast Mode** |
+| | **Fast Mode** | **Universal Mode** |
 | --- | --- | --- |
-| Which server? | Whichever session you paste into | The one you configured |
-| Terminal | Anything that can paste text | Anything: you run the command yourself |
-| Path | Encrypted, through a relay that only sees ciphertext, then `clift fetch` | Your own SSH/SFTP, directly |
-| On the server | The same `clift` binary, run once per paste | Nothing at all |
+| Good for | One server you have already set up | Any number of servers, including ones you have not configured |
+| Which server? | The one you configured | Whichever session you paste into |
+| Path | Your own SSH and SFTP, directly | Encrypted, through a relay that only sees ciphertext, then `clift fetch` |
+| On the server | Nothing at all | The same `clift` binary, run once per paste |
+| Before the first paste | `clift setup <ssh-host>` | The same, plus a relay you run or deploy |
 
-Universal Mode is for people with several servers, and it is the one a key
-combination drives. Fast Mode is for one server you have already set up, when
-you would rather no third party were involved at all.
+Both are driven by the same key combination and both leave plain text alone.
+Start with Fast Mode: it is two commands and touches nothing you do not already
+have. Move to Universal Mode when one configured host stops being enough, which
+is the moment you stop wanting to tell Clift which machine you mean.
 
-## Quick start (Universal Mode)
+## Quick start
 
 ### 1. Install on your laptop
 
@@ -66,11 +68,11 @@ PS> irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
 
 Both download the release archive together with its `SHA256SUMS`, install
 nothing unless the digest matches, and never ask for sudo. The installer then
-starts `clift setup`, which asks a few questions: which mode you want, the
-relay's address (checked with a real round trip before it is saved), and which
-key combination to paste with. On macOS and Windows the key's helper is
-registered to start at login and runs hidden; no terminal has to stay open.
-Run `clift setup` again any time.
+starts `clift setup`, which asks which mode you want and takes it from there:
+an SSH host alias for Fast Mode, or a relay address for Universal Mode, checked
+with a real round trip before it is saved. Answering the questions does the
+next two steps for you; the commands are here so that you can see what they
+were. Run `clift setup` again any time.
 
 Other ways in: `brew install leazoot/clift/clift`, `cargo binstall --git
 https://github.com/leazoot/clift clift-cli`, the
@@ -79,7 +81,52 @@ https://github.com/leazoot/clift clift-cli`, the
 [`packaging/`](packaging/). Add `--no-setup` (or set `CLIFT_NO_SETUP=1`) to
 install without the questions.
 
-### 2. Get a relay
+### 2. Name one server
+
+```console
+$ clift setup core
+```
+
+`core` is an alias from your own `~/.ssh/config`. Clift shows the user, host and
+port it resolved to, waits for you to agree, then checks SSH, checks SFTP,
+creates a private inbox and uploads a file it deletes again. Nothing is written
+to the configuration unless all of that passed, and the first host you set up
+becomes the default.
+
+### 3. Register the key
+
+```console
+$ clift hotkey --install
+```
+
+On macOS and Windows the helper starts at login and runs hidden; no terminal
+has to stay open. macOS will ask for Accessibility permission the first time,
+because typing into another application is what the permission is for.
+
+### 4. Paste
+
+Take a screenshot, then press the key in the terminal that is talking to your
+server (`Cmd+Shift+V` on macOS, `Ctrl+Alt+V` elsewhere, unless you changed it).
+One line is typed into the session:
+
+```text
+Please inspect this file: '/home/dev/.cache/clift/inbox/2026-09-05/2a07…/clipboard.png'
+```
+
+The agent reads it. Plain text on the clipboard is left alone: press the key
+with text copied and your terminal pastes it as it always did.
+
+That is the whole of Fast Mode. The rest of this page is what to do when one
+server is not enough.
+
+## Any number of servers: Universal Mode
+
+Fast Mode sends to the host you configured. Universal Mode sends to whichever
+SSH session you paste into, which means you never tell Clift which machine you
+mean and you never configure the machines at all. The cost is a relay, and one
+install per server.
+
+### 1. Get a relay
 
 A relay holds the encrypted attachment for a few minutes and cannot read it.
 Run your own with `clift-relayd`, or deploy one to a free Cloudflare account
@@ -90,7 +137,7 @@ in one click:
 Give its address to `clift setup` on your laptop, or later with
 `clift config set relay.url https://clift-relay.<you>.workers.dev`.
 
-### 3. Set up each server
+### 2. Set up each server
 
 **Recommended: let the agent do it.** The agent that will receive your
 screenshots can install and configure Clift itself. Paste this into it, with
@@ -131,7 +178,7 @@ told the address once. Claude Code can go one step further: a
 you press Enter, so Claude reads the file instead of first deciding to run the
 command.
 
-### 4. Paste
+### 3. Paste
 
 Take a screenshot, then in the terminal that is talking to your server press
 the key you chose in setup (`Cmd+Shift+V` on macOS and `Ctrl+Alt+V` on Windows
@@ -145,7 +192,7 @@ Attachment: clift fetch 'clift://v1/…'
 The agent runs it and gets the file. No target to choose, no `ssh` config to
 edit, no plugin to install.
 
-### 5. Bring something back
+### 4. Bring something back
 
 The same key works the other way. On the server, name a file:
 
@@ -161,7 +208,7 @@ anywhere.
 This is for the case where you cannot reach the server from where you are
 sitting. When you can, `scp` is shorter and Clift will tell you so.
 
-## How it works
+## How Universal Mode works
 
 ```text
  laptop                        relay                         server
@@ -180,18 +227,30 @@ sitting. When you can, `scp` is shorter and Clift will tell you so.
 
 Plain text is never touched: paste it and it pastes as it always did.
 
-## Fast Mode
+## How this compares
 
-One server, your own SSH, nothing in between:
+Several tools solve the same first problem. They differ in what they ask of you
+and in how far they go.
 
-```console
-$ clift setup core                       # checks SSH and SFTP, creates the inbox, remembers it
-$ clift send --clipboard --to core       # prints the path to paste
-```
+| | Clift | [clipssh](https://github.com/samuellawrentz/clipssh) | [clipaste](https://github.com/hqhq1025/clipaste) | [claude-ssh-image-skill](https://github.com/AlexZeitler/claude-ssh-image-skill) |
+| --- | --- | --- | --- | --- |
+| Watches your clipboard | No, reads it once when you press the key | No | Yes, a background service | No |
+| Servers per setup | Any number, unconfigured, in Universal Mode | The host you configure | The host you configure | The host you configure |
+| On the server | Nothing in Fast Mode | Nothing | Nothing | A client binary |
+| Network shape | Your SSH, or a relay that holds ciphertext | Your SSH | Your SSH | A reverse tunnel to a local daemon |
+| Brings files back | Yes, `clift copy` | No | No | No |
+| Tied to one agent | No | No | No | Claude Code |
 
-Files go over the `ssh` and `sftp` you already have: the same `~/.ssh/config`,
-the same agent, the same hardware keys, the same `known_hosts`. Clift never
-weakens host verification and never reads a private key.
+Where Clift loses: if you have one Mac and one server and want the shortest
+possible install, a tool that watches the clipboard and rewrites it is one
+`brew install` and no configuration, and Clift is two commands. Universal Mode
+also asks you to run or deploy a relay before the first paste, which is the
+price of not having to name the server.
+
+Where it wins: nothing sits in the background reading your clipboard, nothing
+is installed on the server in Fast Mode, the attachment is encrypted end to end
+when it does travel through a relay, files come back as well as go out, and no
+part of it knows or cares which agent or terminal you use.
 
 ## Commands
 
