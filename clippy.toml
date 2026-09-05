@@ -1,0 +1,5 @@
+# `unwrap` and `expect` are denied in shipped code because every fallible path
+# must surface a CliftError carrying stage, cause and remedy. Tests may still
+# unwrap: a panic there is a test failure, not a user-facing crash.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

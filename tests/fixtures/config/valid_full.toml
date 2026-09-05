@@ -1,0 +1,19 @@
+version = 1
+default_target = "core"
+
+[defaults]
+max_file_size  = "50MiB"
+max_batch_size = "100MiB"
+max_files      = 20
+retention      = "24h"
+format         = "instruction"
+
+[targets.core]
+ssh_host        = "core"
+remote_dir      = "~/.cache/clift/inbox"
+format          = "instruction"
+remote_home     = "/home/dev"
+last_success_at = "2026-08-30T12:00:00Z"
+
+[targets.hk]
+ssh_host = "hk"

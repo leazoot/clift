@@ -1,0 +1,5 @@
+version = 999
+default_target = "core"
+
+[targets.core]
+ssh_host = "core"

@@ -1,0 +1,15 @@
+[package]
+name = "clift-transport"
+description = "OpenSSH/SFTP transport adapter for Clift. Drives the system ssh and sftp executables."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clift-core.workspace = true
+getrandom.workspace = true
+
+[lints]
+workspace = true

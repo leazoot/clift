@@ -1,0 +1,87 @@
+# BATCH-01 targets macOS only. The three-platform matrix belongs to v1.0.
+# Every step here must be reproducible locally with the same command, so that a
+# red CI can always be diagnosed without pushing another commit.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly advisory sweep. Unlike the per-push run, this one is blocking.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test, release, boundaries
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the exact version; rustup installs it on demand.
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Architecture boundaries
+        run: ./scripts/check-architecture.sh
+
+      - name: Binary smoke test
+        run: |
+          version="$(./target/release/clift --version)"
+          echo "$version"
+          test -n "$version"
+
+  msrv:
+    name: MSRV 1.95
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # An explicit `+toolchain` overrides rust-toolchain.toml, which is how this
+      # job escapes the pinned channel without editing the file.
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.95 --profile minimal
+
+      - name: Build
+        run: cargo +1.95 build --workspace
+
+      - name: Test
+        run: cargo +1.95 test --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: macos-latest
+    # Advisory databases change without any commit of ours, so a new
+    # advisory must not turn an unrelated pull request red. The weekly scheduled
+    # run is blocking instead, which keeps advisories from being ignored.
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Check
+        run: cargo deny check

@@ -1,0 +1,37 @@
+[package]
+name = "clift-cli"
+description = "Command line interface for Clift, the universal attachment bridge for remote terminal agents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "clift"
+path = "src/main.rs"
+
+[dependencies]
+clift-core.workspace = true
+clift-clipboard.workspace = true
+clift-transport.workspace = true
+clift-relay.workspace = true
+clift-inject.workspace = true
+clap.workspace = true
+serde.workspace = true
+getrandom.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Lets `cargo binstall` fetch the archives the release workflow publishes instead
+# of compiling. The names must stay in step with .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/clift-{ version }-{ target }{ archive-suffix }"
+bin-dir = "clift-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[lints]
+workspace = true

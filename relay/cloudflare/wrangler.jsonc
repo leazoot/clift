@@ -1,0 +1,25 @@
+// Clift's relay as a Cloudflare Worker. See README.md in this directory.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "clift-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+
+  // One Durable Object holds everything. Its single thread is what makes
+  // "hand an object to exactly one of several simultaneous fetches" true
+  // without any locking, and what lets the health endpoint count what is held.
+  "durable_objects": {
+    "bindings": [{ "name": "RELAY", "class_name": "CliftRelay" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["CliftRelay"] }],
+
+  // The same knobs as clift-relayd, with the same names and the same syntax.
+  // Change them here or with `wrangler deploy --var NAME:VALUE`.
+  "vars": {
+    "CLIFT_RELAY_MAX_BYTES": "8MiB",
+    "CLIFT_RELAY_TTL": "5m",
+    "CLIFT_RELAY_MAX_TOTAL_BYTES": "256MiB",
+    "CLIFT_RELAY_RATE_LIMIT": "60"
+  }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "clift-clipboard"
+description = "Platform clipboard adapter for Clift."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clift-core.workspace = true
+
+# Platform bindings, confined to this crate and to macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+
+[lints]
+workspace = true

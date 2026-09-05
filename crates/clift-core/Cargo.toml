@@ -1,0 +1,33 @@
+[package]
+name = "clift-core"
+description = "Domain model, use cases and ports for Clift. Contains no IO and no platform code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+# Universal Mode's envelope. Pure computation, no IO, no platform API -- which
+# is why it is allowed in this crate at all.
+chacha20poly1305.workspace = true
+base64.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
+[dev-dependencies]
+getrandom.workspace = true
+# The crate's own fakes, for integration tests that live in tests/ and so do
+# not get cfg(test) on the library. scripts/check-architecture.sh exempts this
+# one manifest and only this one: no crate that ships may turn the feature on.
+clift-core = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true
+
+[features]
+# In-memory port implementations for unit tests. Never enabled by a crate that ships.
+testing = []

@@ -1,0 +1,31 @@
+[package]
+name = "clift-relayd"
+description = "Self-hostable relay for Clift's Universal Mode. Stores ciphertext briefly and cannot read it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "clift-relayd"
+path = "src/main.rs"
+
+[dependencies]
+clift-core.workspace = true
+tiny_http.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+
+# Lets `cargo binstall` fetch the archives the release workflow publishes instead
+# of compiling. The names must stay in step with .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/clift-{ version }-{ target }{ archive-suffix }"
+bin-dir = "clift-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[lints]
+workspace = true

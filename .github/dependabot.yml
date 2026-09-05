@@ -1,0 +1,41 @@
+# Dependabot opens pull requests for outdated dependencies. It never merges
+# anything: every update still goes through CI (fmt, clippy, tests, cargo deny)
+# and a person.
+#
+# Updates are grouped so that a routine week produces one Cargo PR and one
+# Actions PR rather than a dozen, and each group still lists every crate it
+# touches. A security advisory is never grouped; it arrives on its own.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    # Major bumps of a dependency are a decision, not maintenance; they arrive
+    # as their own PR and wait for someone to read the changelog.
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The Cloudflare Worker's toolchain (wrangler, workerd types). The Worker is
+  # not part of the Rust build, so this cannot affect the binaries.
+  - package-ecosystem: npm
+    directory: /relay/cloudflare
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      worker-toolchain:
+        patterns: ["*"]
+    open-pull-requests-limit: 3

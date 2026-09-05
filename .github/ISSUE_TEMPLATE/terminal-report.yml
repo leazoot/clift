@@ -1,0 +1,102 @@
+# A terminal report says what was run, what happened, and when. "It works for
+# me" is not a report; "these six things were checked, and here is the
+# output" is.
+name: Terminal report
+description: Report a terminal or SSH client you tried Clift in, whether it worked or not.
+title: "[terminal] <terminal> on <local OS> to <remote OS>"
+labels: ["terminal-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. A report is useful whether the result was good or bad. A
+        terminal where it **fails** is the more important one.
+
+        **Do not paste a token.** Anything that looks like `clift://v1/…` carries
+        a decryption key; replace it with `clift://v1/…` when you quote output.
+  - type: input
+    id: local
+    attributes:
+      label: Local machine
+      description: Operating system and version, and the CPU architecture if you know it.
+      placeholder: macOS 15.1, Apple Silicon
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal or SSH client, with version
+      placeholder: iTerm2 3.5.11
+    validations:
+      required: true
+  - type: input
+    id: remote
+    attributes:
+      label: Remote host
+      description: Operating system and version the agent runs on.
+      placeholder: Ubuntu 24.04, non-root user
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Universal Mode (token pasted into the session, `clift fetch` on the host)
+        - Fast Mode (`clift send` over your own SSH)
+    validations:
+      required: true
+  - type: dropdown
+    id: entry
+    attributes:
+      label: How the text got into the terminal
+      options:
+        - "`clift hotkey`, one key combination"
+        - "`clift paste --copy`, then the terminal's ordinary paste key"
+        - "`clift paste --inject`"
+        - "Something else (say what, below)"
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: "`clift --version` on both ends"
+      description: The local machine and the remote host. Paste the output as it is.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: What was checked
+      description: Tick only what you actually observed. An unticked box is fine; a ticked one that was not checked is not.
+      options:
+        - label: The host in the session I pasted into got the file
+        - label: Another host I also have configured did **not** get it
+        - label: I did not run `clift target use`
+        - label: The first `clift fetch` succeeded and a second one with the same token failed
+        - label: A token older than its TTL failed
+        - label: The path the agent received exists on that host, is absolute, and the file opens
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Worked, all six checks passed
+        - Partly, some checks passed, see evidence
+        - Failed, the attachment did not arrive
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: The commands you ran and a trimmed copy of their output, with the date. Tokens replaced with `clift://v1/…`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Quirks, what you had to change, what surprised you.

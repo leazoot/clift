@@ -1,0 +1,6 @@
+# Pinned so that local builds and CI compile with byte-identical toolchain
+# behaviour. The MSRV job overrides this with an explicit `cargo +<version>`.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

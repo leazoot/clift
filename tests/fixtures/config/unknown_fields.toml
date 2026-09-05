@@ -1,0 +1,15 @@
+version = 1
+default_target = "core"
+retention_days = 7
+
+[defaults]
+max_files = 20
+max_filez = 21
+
+[targets.core]
+ssh_host = "core"
+sshhost  = "core"
+
+# A whole section this build no longer defines, as written by an older one.
+[integrations.wezterm]
+paste_mode = "dedicated"

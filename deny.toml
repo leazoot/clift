@@ -1,0 +1,56 @@
+# cargo-deny configuration. Run with: cargo deny check
+#
+# Clift ships as a single binary under Apache-2.0, so every dependency must be
+# license-compatible with redistribution in binary form, and no dependency may
+# come from a source other than crates.io.
+
+[graph]
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Mozilla's CA root bundle, reached through `webpki-roots`. It is data
+    # rather than code, and CDLA-Permissive-2.0 permits redistribution without
+    # conditions on the binary it ships in -- which is the only question
+    # Apache-2.0 redistribution asks. Allowed by name rather than by widening
+    # the policy: this entry exists for one dependency and should be removed if
+    # that dependency goes.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# No SSH protocol library may ever enter the dependency graph: the specification requires
+# driving the system ssh/sftp executables instead of embedding a credential stack.
+deny = [
+    { name = "ssh2" },
+    { name = "russh" },
+    { name = "thrussh" },
+    { name = "libssh2-sys" },
+    { name = "openssh" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

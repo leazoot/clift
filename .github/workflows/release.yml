@@ -1,0 +1,234 @@
+# Builds clift and clift-relayd for every supported target and attaches them to
+# a GitHub Release, with a SHA256SUMS file, two CycloneDX SBOMs and a Sigstore
+# signature bundle next to every file, when a `v*` tag is pushed.
+#
+# Signing is keyless: the signer is this workflow's own OIDC identity
+# (repository + workflow path + tag), certified by Sigstore's Fulcio and logged
+# in Rekor. There is no private key anywhere -- nothing to store as a secret,
+# nothing to leak, nothing to rotate. A verifier checks that the certificate
+# names this repository's release workflow at a `v*` tag; `SECURITY.md` shows
+# the command.
+#
+# Each target builds natively on its own runner rather than cross-compiling:
+# the TLS stack (rustls/ring) has a C build step that is happiest with the
+# platform's own toolchain, and a native build is also the only kind that can
+# run its own binary as a smoke test.
+#
+# The Linux binaries are static musl builds. A glibc build carries the glibc
+# version of the runner it was made on: an aarch64 build made on Ubuntu 24.04
+# needs GLIBC_2.39 and will not start on Debian 12. A static binary starts on
+# any Linux of its architecture, Alpine included.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Each job asks for what it needs. Only the publishing job writes releases,
+# and only it needs an OIDC token (that token is what Sigstore signs with).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+
+      # ring's C sources are compiled by cc-rs, which looks for
+      # <target>-gcc and does not know that Debian's musl-tools names the
+      # compiler musl-gcc for whichever architecture the runner is.
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y musl-tools
+          arch="${{ matrix.target }}"; arch="${arch%%-*}"
+          echo "CC_${arch}_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "AR_${arch}_unknown_linux_musl=ar" >> "$GITHUB_ENV"
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "${tag_version}" != "${cargo_version}" ]]; then
+              echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}" >&2
+              exit 1
+            fi
+          fi
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p clift-cli -p clift-relayd
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/clift"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="${bin}.exe"
+          "$bin" --version
+          "$bin" --version | grep -q "${{ steps.version.outputs.version }}"
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          target="${{ matrix.target }}"
+          stage="clift-${version}-${target}"
+          mkdir -p "dist/${stage}"
+          cp LICENSE NOTICE README.md "dist/${stage}/"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${target}/release/clift.exe" "target/${target}/release/clift-relayd.exe" "dist/${stage}/"
+            (cd dist && 7z a -tzip "${stage}.zip" "${stage}" > /dev/null)
+            archive="dist/${stage}.zip"
+          else
+            cp "target/${target}/release/clift" "target/${target}/release/clift-relayd" "dist/${stage}/"
+            tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+            archive="dist/${stage}.tar.gz"
+          fi
+          if command -v sha256sum > /dev/null; then
+            (cd dist && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+          else
+            (cd dist && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+          fi
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        run: |
+          echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx@0.5.9
+
+      # One SBOM per shipped binary, from Cargo.lock, listing the dependencies
+      # of every target at once (`--target all`): a release is one set of
+      # archives, and one document should describe what any of them contains.
+      - name: Generate
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --target all -q
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+          mv crates/clift-cli/clift-cli.cdx.json "dist/clift-${version}.cdx.json"
+          mv crates/clift-relayd/clift-relayd.cdx.json "dist/clift-relayd-${version}.cdx.json"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          # The Windows runner's sha256sum writes " *name" (binary mode);
+          # normalise so every line reads the same.
+          cat -- *.sha256 | sed 's/ \*/  /' > SHA256SUMS
+          rm -- *.sha256
+          sha256sum -- *.cdx.json >> SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      # v4 of the installer, not v3: a pinned cosign release is verified before
+      # it is used, and v3 looks for a detached `.sig` that cosign 3.x releases
+      # no longer publish (they ship `.sigstore.json` bundles, which v4 reads).
+      # Pinned to a full version: the installer publishes no `v4` major tag.
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Every published file gets a bundle: archives, SBOMs and SHA256SUMS
+      # itself. Signing SHA256SUMS alone would do, but a person holding one
+      # archive should not have to fetch a second file to check it.
+      - name: Sign
+        run: |
+          cd artifacts
+          for file in *.tar.gz *.zip *.cdx.json SHA256SUMS; do
+            cosign sign-blob --yes --bundle "${file}.sigstore.json" "${file}"
+          done
+
+      # Verified here with exactly the identity a user would pin, so a bundle
+      # nobody could verify is a failed run rather than a published one.
+      - name: Verify what was signed
+        run: |
+          cd artifacts
+          for file in *.tar.gz *.zip *.cdx.json SHA256SUMS; do
+            cosign verify-blob \
+              --bundle "${file}.sigstore.json" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${file}"
+          done
+          ls -l
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "Clift ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --notes "Binaries for macOS (Apple Silicon and Intel), Linux (x86_64 and aarch64, static) and Windows (x86_64). Install with \`install.sh\` / \`install.ps1\` from the repository, which verify against \`SHA256SUMS\`. Every file here is signed with Sigstore by this release workflow's own identity; the \`.sigstore.json\` next to it is the bundle, and \`SECURITY.md\` shows how to verify one. The two \`.cdx.json\` files are CycloneDX SBOMs for \`clift\` and \`clift-relayd\`." \
+            artifacts/*

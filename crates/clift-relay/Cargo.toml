@@ -1,0 +1,23 @@
+[package]
+name = "clift-relay"
+description = "Relay client adapter for Clift's Universal Mode. Carries ciphertext only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clift-core.workspace = true
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# On Windows a proxy is usually set in the system's Internet Options rather
+# than in an environment variable, and the browser and curl both honour it;
+# this makes Clift honour it too. Environment variables still win.
+[target.'cfg(windows)'.dependencies]
+ureq = { workspace = true, features = ["win-system-proxy"] }
+
+[lints]
+workspace = true

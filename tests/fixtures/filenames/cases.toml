@@ -1,0 +1,148 @@
+# Inputs for SafeFileName::sanitize.
+#
+# Unlike tests/fixtures/ssh-stderr/, these are constructed rather than
+# captured: they are the shapes a screenshot tool or a file manager can
+# hand over, listed so that the acceptance criteria can be
+# checked one by one instead of taken on trust.
+#
+# `expected` pins the exact result. It is omitted where the result depends
+# on MAX_LEN; those cases are still checked against the invariants every
+# case must satisfy, plus `ends_with` where the extension must survive.
+
+[[case]]
+name = "space"
+input = "shot 1.png"
+expected = "shot 1.png"
+
+[[case]]
+name = "chinese"
+input = "报告 最终版.pdf"
+expected = "报告 最终版.pdf"
+
+[[case]]
+name = "emoji"
+input = "🎉 party 🎂.gif"
+expected = "🎉 party 🎂.gif"
+
+[[case]]
+name = "single-quote"
+input = "it's mine.png"
+expected = "it's mine.png"
+
+[[case]]
+name = "double-quote"
+input = "say \"hi\".png"
+expected = "say \"hi\".png"
+
+[[case]]
+name = "backtick"
+input = "`id`.png"
+expected = "`id`.png"
+
+[[case]]
+name = "dollar"
+input = "$HOME cost $5.png"
+expected = "$HOME cost $5.png"
+
+[[case]]
+name = "newline"
+input = "two\nlines.png"
+expected = "twolines.png"
+
+[[case]]
+name = "carriage-return"
+input = "old\rmac.png"
+expected = "oldmac.png"
+
+[[case]]
+name = "nul"
+input = "nul\u0000byte.png"
+expected = "nulbyte.png"
+
+[[case]]
+name = "semicolon"
+input = "a;rm -rf.png"
+expected = "a;rm -rf.png"
+
+[[case]]
+name = "traversal"
+input = "../../../etc/passwd"
+expected = "passwd"
+
+[[case]]
+name = "traversal-only"
+input = "../.."
+expected = "attachment"
+
+[[case]]
+name = "absolute-path"
+input = "/etc/shadow"
+expected = "shadow"
+
+[[case]]
+name = "windows-path"
+input = "C:\\Users\\me\\shot.png"
+expected = "shot.png"
+
+[[case]]
+name = "leading-dash"
+input = "-rf.png"
+expected = "rf.png"
+
+[[case]]
+name = "only-dashes"
+input = "---"
+expected = "attachment"
+
+[[case]]
+name = "empty"
+input = ""
+expected = "attachment"
+
+[[case]]
+name = "dot"
+input = "."
+expected = "attachment"
+
+[[case]]
+name = "dotdot"
+input = ".."
+expected = "attachment"
+
+[[case]]
+name = "no-extension"
+input = "README"
+expected = "README"
+
+[[case]]
+name = "dotfile"
+input = ".bashrc"
+expected = ".bashrc"
+
+[[case]]
+name = "multiple-extensions"
+input = "archive.tar.gz"
+expected = "archive.tar.gz"
+
+[[case]]
+name = "surrounding-space"
+input = "  padded.png  "
+expected = "padded.png"
+
+[[case]]
+name = "overlong-ascii"
+input = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+ends_with = ".png"
+
+[[case]]
+name = "overlong-chinese"
+input = "写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写写.png"
+ends_with = ".png"
+
+[[case]]
+name = "overlong-no-ext"
+input = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[case]]
+name = "overlong-extension"
+input = "x.yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"

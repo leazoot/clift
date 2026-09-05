@@ -1,0 +1,2 @@
+subsystem request failed on channel 0
+Connection closed

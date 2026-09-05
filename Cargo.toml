@@ -1,0 +1,86 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/clift-cli",
+    "crates/clift-core",
+    "crates/clift-clipboard",
+    "crates/clift-transport",
+    "crates/clift-relay",
+    "crates/clift-relayd",
+    "crates/clift-inject",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/leazoot/clift"
+authors = ["leazoot <leazoot@gmail.com>"]
+
+[workspace.dependencies]
+clift-core = { path = "crates/clift-core", version = "0.1.0" }
+clift-clipboard = { path = "crates/clift-clipboard", version = "0.1.0" }
+clift-transport = { path = "crates/clift-transport", version = "0.1.0" }
+clift-relay = { path = "crates/clift-relay", version = "0.1.0" }
+clift-inject = { path = "crates/clift-inject", version = "0.1.0" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.1.4", default-features = false, features = ["display", "parse", "serde", "std"] }
+# `suggestions` is deliberately off: an unknown subcommand must
+# fail outright rather than be guessed at or fuzzily matched.
+clap = { version = "4.6.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color"] }
+serde_json = "1.0.151"
+# Objective-C runtime bindings, for NSPasteboard. The `objc2` family is the
+# maintained one; `cocoa` + `objc` are unmaintained and must not be used in new
+# code. Only clift-clipboard depends on these, and only on macOS.
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSURL", "NSData", "NSDictionary", "NSValue", "NSObject", "NSEnumerator"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSImageRep", "NSBitmapImageRep", "NSGraphics"] }
+
+# Signal handling, for one job only: removing Clift's temporary files when the
+# user presses Ctrl+C. Rust's default SIGINT ends the process without running
+# any `Drop`, so RAII alone leaves a copy of the user's screenshot behind
+# `signal-hook`'s iterator API keeps the work on an ordinary thread
+# rather than inside a signal handler, so no unsafe code is needed here.
+signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
+
+# The OS CSPRNG. Names the intermediate `.part` file of every upload, backs the
+# batch identifier, and draws every Universal Mode object key and nonce. Nothing
+# here may fall back to a predictable value.
+getrandom = "0.4.3"
+
+# Authenticated encryption for Universal Mode. XChaCha20-Poly1305 is the variant
+# with a 192-bit nonce, which is what makes a per-object random nonce safe
+# without a counter to persist anywhere. RustCrypto's implementation is pure
+# Rust, audited, and pulls in no C toolchain -- which matters because the same
+# binary has to build on whatever the user's VPS runs.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "getrandom"] }
+
+# base64url, for the object id and key material inside a token. `simd-unsafe` is
+# off: this encodes at most 48 bytes and the unsafe kernels buy nothing.
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+
+# The relay client. Blocking, small, and rustls-backed so no OpenSSL has to be
+# present on the remote host that runs `clift fetch`.
+#
+# Three feature choices, each for a reason:
+#   * gzip off -- relay bodies are ciphertext and do not compress;
+#   * the bundled Mozilla root set rather than `platform-verifier`. The
+#     platform verifier was tried and rejected: it pulls in fifteen further
+#     crates including an Android JNI binding, and it still arrives at a
+#     bundled root set under the same licence, so it costs a great deal and
+#     settles nothing. An operator whose relay sits behind an enterprise CA can
+#     terminate TLS themselves or run the relay on the private network, which
+#     is what self-hosting is for.
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+
+# The self-hostable relay server. Blocking and thread-per-connection, which is
+# the right shape for a service whose entire job is to hold a few megabytes for
+# a few minutes. Deliberately not tokio: the design keeps an async runtime out of
+# this workspace.
+tiny_http = "0.12.0"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
