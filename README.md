@@ -75,8 +75,9 @@ Run `clift setup` again any time.
 Other ways in: `brew install leazoot/clift/clift`, `cargo binstall --git
 https://github.com/leazoot/clift clift-cli`, the
 [Releases](https://github.com/leazoot/clift/releases) page, or
-`cargo build --release` with Rust 1.95 or newer. Add `--no-setup` (or set
-`CLIFT_NO_SETUP=1`) to install without the questions.
+`cargo build --release` with Rust 1.95 or newer. A Scoop manifest is in
+[`packaging/`](packaging/). Add `--no-setup` (or set `CLIFT_NO_SETUP=1`) to
+install without the questions.
 
 ### 2. Get a relay
 
