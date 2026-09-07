@@ -55,7 +55,7 @@ jobs:
           - os: windows-2022
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install target
         run: rustup target add ${{ matrix.target }}
@@ -122,7 +122,7 @@ jobs:
           fi
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -134,7 +134,7 @@ jobs:
     name: SBOM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Version
         id: version
@@ -156,7 +156,7 @@ jobs:
           mv crates/clift-relayd/clift-relayd.cdx.json "dist/clift-relayd-${version}.cdx.json"
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: dist/*.cdx.json
@@ -171,9 +171,9 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
