@@ -77,12 +77,12 @@ report" issue form asks the right questions.
 
 ## Running the checks
 
-```console
-$ cargo fmt --all -- --check
-$ cargo clippy --workspace --all-targets -- -D warnings
-$ cargo test --workspace
-$ ./scripts/check-architecture.sh
-$ cargo deny check
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./scripts/check-architecture.sh
+cargo deny check
 ```
 
 Some tests need more than a compiler:

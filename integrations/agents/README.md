@@ -32,8 +32,8 @@ runs):
 
 One way to do it, on the server:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
 ```
 
 For Claude Code there is one more, optional piece: a hook that redeems the

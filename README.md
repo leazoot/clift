@@ -56,14 +56,14 @@ is the moment you stop wanting to tell Clift which machine you mean.
 
 One line on macOS or Linux:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh
 ```
 
 or on Windows, in PowerShell:
 
 ```powershell
-PS> irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
 ```
 
 Both download the release archive together with its `SHA256SUMS`, install
@@ -83,8 +83,8 @@ install without the questions.
 
 ### 2. Name one server
 
-```console
-$ clift setup core
+```bash
+clift setup core
 ```
 
 `core` is an alias from your own `~/.ssh/config`. Clift shows the user, host and
@@ -95,8 +95,8 @@ becomes the default.
 
 ### 3. Register the key
 
-```console
-$ clift hotkey --install
+```bash
+clift hotkey --install
 ```
 
 On macOS and Windows the helper starts at login and runs hidden; no terminal
@@ -157,16 +157,16 @@ instructions file so that it knows what to do whenever a token arrives. It is
 written to be read by a person too, and it is worth reading once, because it is
 the list of commands your agent will run. You can also hand it over directly:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.md | claude
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.md | claude
 ```
 
 **By hand.** Three commands on the server:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh -s -- --no-setup
-$ clift config set relay.url https://clift-relay.<you>.workers.dev
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh -s -- --no-setup
+clift config set relay.url https://clift-relay.<you>.workers.dev
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
 ```
 
 The last line appends the paragraph that tells the agent how to handle a

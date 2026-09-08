@@ -18,16 +18,16 @@ One Worker and one Durable Object, on a free Cloudflare account, at an address
 like `https://clift-relay.<your-subdomain>.workers.dev`. Then, on the machine
 you paste from:
 
-```console
-$ clift config set relay.url https://clift-relay.<your-subdomain>.workers.dev
+```bash
+clift config set relay.url https://clift-relay.<your-subdomain>.workers.dev
 ```
 
 And once on each machine an agent runs on, because a token carries the object
 and the key but never the relay's address:
 
-```console
-$ clift config set relay.url https://clift-relay.<your-subdomain>.workers.dev
-$ # or, for one command:  CLIFT_RELAY_URL=https://… clift fetch '<token>'
+```bash
+clift config set relay.url https://clift-relay.<your-subdomain>.workers.dev
+# or, for one command:  CLIFT_RELAY_URL=https://… clift fetch '<token>'
 ```
 
 That is all. `clift paste` now works into any SSH session with no target
@@ -103,19 +103,19 @@ choose one.
 
 ## Running it yourself, without the button
 
-```console
-$ cd relay/cloudflare
-$ npm install
-$ npx wrangler login          # opens a browser, once
-$ npx wrangler deploy
+```bash
+cd relay/cloudflare
+npm install
+npx wrangler login          # opens a browser, once
+npx wrangler deploy
 ```
 
 `wrangler deploy` prints the URL. To run the contract tests against the Worker
 locally, `npm install` is the only prerequisite; the tests start `wrangler dev`
 themselves and skip, loudly, if it is not installed:
 
-```console
-$ CLIFT_E2E_REQUIRE_WRANGLER=1 cargo test -p clift-relay --test real_relay
+```bash
+CLIFT_E2E_REQUIRE_WRANGLER=1 cargo test -p clift-relay --test real_relay
 ```
 
 ## What it does not do

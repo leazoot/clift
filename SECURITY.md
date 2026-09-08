@@ -52,8 +52,8 @@ The signer is not a person with a key; it is the release workflow in this
 repository, running at a `v*` tag, with a certificate issued for that run and a
 record in Sigstore's public log. So what you check is that identity:
 
-```console
-$ cosign verify-blob \
+```bash
+cosign verify-blob \
     --bundle clift-<version>-<target>.tar.gz.sigstore.json \
     --certificate-identity-regexp '^https://github\.com/leazoot/clift/\.github/workflows/release\.yml@refs/tags/v' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \

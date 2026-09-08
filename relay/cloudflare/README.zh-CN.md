@@ -16,15 +16,15 @@
 一个 Worker 加一个 Durable Object,跑在免费的 Cloudflare 账户里,地址形如
 `https://clift-relay.<你的子域>.workers.dev`。然后在你**发起粘贴**的那台机器上:
 
-```console
-$ clift config set relay.url https://clift-relay.<你的子域>.workers.dev
+```bash
+clift config set relay.url https://clift-relay.<你的子域>.workers.dev
 ```
 
 再在**每台跑 Agent 的机器**上各做一次,因为 Token 里带着对象和密钥,唯独不带 Relay 的地址:
 
-```console
-$ clift config set relay.url https://clift-relay.<你的子域>.workers.dev
-$ # 或者只用一次:  CLIFT_RELAY_URL=https://… clift fetch '<token>'
+```bash
+clift config set relay.url https://clift-relay.<你的子域>.workers.dev
+# 或者只用一次:  CLIFT_RELAY_URL=https://… clift fetch '<token>'
 ```
 
 就这些。`clift paste` 现在可以粘进任何 SSH 会话,不用配置 target;对面用 `clift fetch`
@@ -83,18 +83,18 @@ Durable Object 一次只处理一个事件。正是这一根线程让 Relay 唯�
 
 ## 不用按钮,自己部署
 
-```console
-$ cd relay/cloudflare
-$ npm install
-$ npx wrangler login          # 打开一次浏览器
-$ npx wrangler deploy
+```bash
+cd relay/cloudflare
+npm install
+npx wrangler login          # 打开一次浏览器
+npx wrangler deploy
 ```
 
 `wrangler deploy` 会打印 URL。要在本地对着 Worker 跑契约测试,只需 `npm install`;
 测试自己起 `wrangler dev`,没装的话会大声地跳过:
 
-```console
-$ CLIFT_E2E_REQUIRE_WRANGLER=1 cargo test -p clift-relay --test real_relay
+```bash
+CLIFT_E2E_REQUIRE_WRANGLER=1 cargo test -p clift-relay --test real_relay
 ```
 
 ## 它不做什么

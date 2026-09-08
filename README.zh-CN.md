@@ -52,14 +52,14 @@ Agent 读这个路径。服务器上什么都没装,不经过任何 Relay,文件
 
 macOS 或 Linux 上一行:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh
 ```
 
 Windows 上在 PowerShell 里:
 
 ```powershell
-PS> irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
 ```
 
 两个脚本都会把发布包连同它的 `SHA256SUMS` 一起下载,摘要不符就什么都不装,也不需要 sudo。
@@ -73,8 +73,8 @@ Scoop 清单在 [`packaging/`](packaging/)。加 `--no-setup`(或设置 `CLIFT_N
 
 ### 2. 指定一台服务器
 
-```console
-$ clift setup core
+```bash
+clift setup core
 ```
 
 `core` 是你自己 `~/.ssh/config` 里的别名。Clift 会先把解析出来的用户、主机、端口显示给你,
@@ -83,8 +83,8 @@ $ clift setup core
 
 ### 3. 注册组合键
 
-```console
-$ clift hotkey --install
+```bash
+clift hotkey --install
 ```
 
 macOS 和 Windows 上,助手注册为登录时启动并隐藏运行,不需要一直开着终端。
@@ -131,16 +131,16 @@ step fails, and report as its last step says.
 [`install.md`](install.md) 就是它照着做的说明:不用 sudo 安装、指向 Relay、跑 `clift doctor`,再往它自己的指令文件里加一小段,
 让它知道 Token 来了该怎么办。这份说明人也读得懂,值得先看一遍,因为它就是你的 Agent 将要执行的命令清单。也可以直接把文件喂给它:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.md | claude
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.md | claude
 ```
 
 **手动。** 在服务器上三条命令:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh -s -- --no-setup
-$ clift config set relay.url https://clift-relay.<you>.workers.dev
-$ curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh -s -- --no-setup
+clift config set relay.url https://clift-relay.<you>.workers.dev
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
 ```
 
 最后一行追加的那一段告诉 Agent 怎么处理 Token、用过的 Token 和没配 Relay 的情况。
