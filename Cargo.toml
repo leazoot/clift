@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -19,11 +19,11 @@ repository = "https://github.com/leazoot/clift"
 authors = ["leazoot <leazoot@gmail.com>"]
 
 [workspace.dependencies]
-clift-core = { path = "crates/clift-core", version = "0.1.0" }
-clift-clipboard = { path = "crates/clift-clipboard", version = "0.1.0" }
-clift-transport = { path = "crates/clift-transport", version = "0.1.0" }
-clift-relay = { path = "crates/clift-relay", version = "0.1.0" }
-clift-inject = { path = "crates/clift-inject", version = "0.1.0" }
+clift-core = { path = "crates/clift-core", version = "0.1.1" }
+clift-clipboard = { path = "crates/clift-clipboard", version = "0.1.1" }
+clift-transport = { path = "crates/clift-transport", version = "0.1.1" }
+clift-relay = { path = "crates/clift-relay", version = "0.1.1" }
+clift-inject = { path = "crates/clift-inject", version = "0.1.1" }
 
 serde = { version = "1.0.229", features = ["derive"] }
 toml = { version = "1.1.4", default-features = false, features = ["display", "parse", "serde", "std"] }

@@ -7,6 +7,10 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.1] - 2026-09-08
+
 ### Fixed
 
 - In Fast Mode the key combination did nothing a person could see. Where
@@ -18,6 +22,10 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   falls back to the clipboard; the machines that could type were the ones it
   failed on. Both modes now make the choice through the same function, and a
   build check keeps the typing call to a single site.
+- Code blocks in the documents carried a shell prompt, so the copy button
+  handed you a line the shell would reject. Blocks that are meant to be run now
+  copy as they are. Blocks that show a session together with its output keep
+  the prompt, because there it is what tells you which line is yours.
 
 ## [0.1.0] - 2026-09-04
 
