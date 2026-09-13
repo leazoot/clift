@@ -5,9 +5,9 @@
   <img src="assets/logo-light.png" alt="Clift" width="360">
 </picture>
 
-**Paste a screenshot into the coding agent running on your server.**
+**Paste screenshots from your laptop straight into Claude Code, Codex and other coding agents on an SSH server.**
 
-Copy on your laptop, paste in the SSH session, and the agent reads the file.
+No image hosting, no SSH config changes, no daemon on the server.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![CI](https://github.com/leazoot/clift/actions/workflows/ci.yml/badge.svg)](https://github.com/leazoot/clift/actions/workflows/ci.yml)
@@ -19,233 +19,462 @@ English · [简体中文](README.zh-CN.md)
 
 ---
 
-You run Claude Code, Codex or another CLI agent over SSH. You take a screenshot.
-The clipboard is on your laptop, the agent is on a server, and `Cmd+V` pastes
-nothing useful. Clift closes that gap without touching your SSH setup, without
-a daemon on the server, and without caring which terminal you use.
+## What does Clift do?
 
-```console
-$ clift setup core              # your ~/.ssh/config alias; checks SSH and SFTP, then remembers it
-$ clift hotkey --install        # one key combination, registered at login
+You use Claude Code, Codex, Gemini CLI or another command-line agent on a server over SSH.
 
-$ # take a screenshot, press the key in the SSH session, and this appears:
+Text pastes fine. Screenshots don't.
+
+The image is on your laptop's clipboard, but the agent runs on another machine. Usually you have to save the image, upload it to the server, then send the path to the agent.
+
+Clift turns those steps into one shortcut:
+
+```text
+Screenshot
+  ↓
+Cmd+Shift+V
+  ↓
+Sent over SSH / SFTP
+  ↓
+A file path appears in the terminal
+  ↓
+The agent reads it
+```
+
+For example:
+
+```text
 Please inspect this file: '/home/dev/.cache/clift/inbox/2026-09-05/2a07…/clipboard.png'
 ```
 
-The agent reads the path. Nothing was installed on the server, no relay is
-involved, and the file went over the `ssh` and `sftp` you already have.
+In Fast Mode the file goes over your existing SSH connection.
 
-## Two ways to get there
+Nothing is installed on the server, and no relay is involved.
 
-| | **Fast Mode** | **Universal Mode** |
-| --- | --- | --- |
-| Good for | One server you have already set up | Any number of servers, including ones you have not configured |
-| Which server? | The one you configured | Whichever session you paste into |
-| Path | Your own SSH and SFTP, directly | Encrypted, through a relay that only sees ciphertext, then `clift fetch` |
-| On the server | Nothing at all | The same `clift` binary, run once per paste |
-| Before the first paste | `clift setup <ssh-host>` | The same, plus a relay you run or deploy |
+---
 
-Both are driven by the same key combination and both leave plain text alone.
-Start with Fast Mode: it is two commands and touches nothing you do not already
-have. Move to Universal Mode when one configured host stops being enough, which
-is the moment you stop wanting to tell Clift which machine you mean.
+# Quick start
 
-## Quick start
+Start with **Fast Mode**.
 
-### 1. Install on your laptop
+If you already have a server you can `ssh` into, it takes a few minutes.
 
-One line on macOS or Linux:
+## 1. Install
+
+The laptop side currently supports macOS and Windows.
+
+### macOS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh
 ```
 
-or on Windows, in PowerShell:
+### Windows
+
+In PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/leazoot/clift/main/install.ps1 | iex
 ```
 
-Both download the release archive together with its `SHA256SUMS`, install
-nothing unless the digest matches, and never ask for sudo. The installer then
-starts `clift setup`, which asks which mode you want and takes it from there:
-an SSH host alias for Fast Mode, or a relay address for Universal Mode, checked
-with a real round trip before it is saved. Answering the questions does the
-next two steps for you; the commands are here so that you can see what they
-were. Run `clift setup` again any time.
+The archive is downloaded together with its `SHA256SUMS`. If the check fails, nothing is installed. No `sudo` needed. When it finishes, `clift setup` starts.
 
-Other ways in: `brew install leazoot/clift/clift`, `cargo binstall --git
-https://github.com/leazoot/clift clift-cli`, the
-[Releases](https://github.com/leazoot/clift/releases) page, or
-`cargo build --release` with Rust 1.95 or newer. A Scoop manifest is in
-[`packaging/`](packaging/). Add `--no-setup` (or set `CLIFT_NO_SETUP=1`) to
-install without the questions.
+---
 
-### 2. Name one server
+## 2. Set up an SSH target
+
+Say your `~/.ssh/config` already has:
+
+```sshconfig
+Host core
+    HostName 10.0.0.8
+    User dev
+```
+
+Run:
 
 ```bash
 clift setup core
 ```
 
-`core` is an alias from your own `~/.ssh/config`. Clift shows the user, host and
-port it resolved to, waits for you to agree, then checks SSH, checks SFTP,
-creates a private inbox and uploads a file it deletes again. Nothing is written
-to the configuration unless all of that passed, and the first host you set up
-becomes the default.
+Clift checks, in order:
 
-### 3. Register the key
+* SSH connects
+* SFTP works
+* The remote inbox can be created
+* A test file can be uploaded and deleted
+
+The configuration is saved only if all of these pass.
+
+Clift does not modify your `~/.ssh/config` and does not read your SSH private keys. Connecting, authentication and `known_hosts` checks are still handled by the system's OpenSSH.
+
+---
+
+## 3. Register the shortcut
 
 ```bash
 clift hotkey --install
 ```
 
-On macOS and Windows the helper starts at login and runs hidden; no terminal
-has to stay open. macOS will ask for Accessibility permission the first time,
-because typing into another application is what the permission is for.
+Default shortcuts:
 
-### 4. Paste
+| Platform | Shortcut      |
+| -------- | ------------- |
+| macOS    | `Cmd+Shift+V` |
+| Windows  | `Ctrl+Alt+V`  |
 
-Take a screenshot, then press the key in the terminal that is talking to your
-server (`Cmd+Shift+V` on macOS, `Ctrl+Alt+V` elsewhere, unless you changed it).
-One line is typed into the session:
+The shortcut helper is registered to start at login.
+
+On macOS, the first time it runs it asks for Accessibility permission, because Clift needs to type the generated text into the current window.
+
+---
+
+## 4. Paste a screenshot
+
+Take a screenshot, then put focus back on the terminal with the SSH session.
+
+Press:
+
+```text
+Cmd+Shift+V
+```
+
+Clift uploads the image to the server, then types this into the current window:
 
 ```text
 Please inspect this file: '/home/dev/.cache/clift/inbox/2026-09-05/2a07…/clipboard.png'
 ```
 
-The agent reads it. Plain text on the clipboard is left alone: press the key
-with text copied and your terminal pastes it as it always did.
+The agent reads the file.
 
-That is the whole of Fast Mode. The rest of this page is what to do when one
-server is not enough.
+### Plain text is not affected
 
-## Any number of servers: Universal Mode
+If the clipboard holds plain text, Clift uploads nothing and the shortcut does nothing. Paste text with `Cmd+V` as usual.
 
-Fast Mode sends to the host you configured. Universal Mode sends to whichever
-SSH session you paste into, which means you never tell Clift which machine you
-mean and you never configure the machines at all. The cost is a relay, and one
-install per server.
+---
 
-### 1. Get a relay
+# How does Fast Mode work?
 
-A relay holds the encrypted attachment for a few minutes and cannot read it.
-Run your own with `clift-relayd`, or deploy one to a free Cloudflare account
-in one click:
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/leazoot/clift/tree/main/relay/cloudflare)
-
-Give its address to `clift setup` on your laptop, or later with
-`clift config set relay.url https://clift-relay.<you>.workers.dev`.
-
-### 2. Set up each server
-
-**Recommended: let the agent do it.** The agent that will receive your
-screenshots can install and configure Clift itself. Paste this into it, with
-your relay's address filled in:
+Fast Mode has no extra service.
 
 ```text
-Set up Clift on this server so I can paste screenshots to you.
-RELAY_URL: https://clift-relay.<you>.workers.dev
-Follow https://raw.githubusercontent.com/leazoot/clift/main/install.md exactly:
-fetch it, work through its TODO list in order, stop and show me the error if a
-step fails, and report as its last step says.
+┌──────────────┐         SSH / SFTP         ┌──────────────┐
+│   Laptop     │ ─────────────────────────▶ │    Server    │
+│              │                            │              │
+│  Clipboard   │                            │ inbox/image  │
+└──────────────┘                            └──────────────┘
 ```
 
-[`install.md`](install.md) is the guide it follows: install without sudo,
-point at the relay, run `clift doctor`, and add a short paragraph to its own
-instructions file so that it knows what to do whenever a token arrives. It is
-written to be read by a person too, and it is worth reading once, because it is
-the list of commands your agent will run. You can also hand it over directly:
+Clift uses what you already have set up:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.md | claude
+```text
+ssh
+sftp
+~/.ssh/config
+known_hosts
+SSH agent / system authentication
 ```
 
-**By hand.** Three commands on the server:
+The server does not need:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh -s -- --no-setup
-clift config set relay.url https://clift-relay.<you>.workers.dev
-curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
-```
+* Clift installed
+* A plugin
+* SSH config changes
+* Open ports
+* A daemon
+* A relay
 
-The last line appends the paragraph that tells the agent how to handle a
-token, a spent token, or a missing relay. Use `AGENTS.md`, `GEMINI.md`, or
-whichever file your agent reads for standing instructions. A token carries the
-object and the key but never the relay's address, which is why every server is
-told the address once. Claude Code can go one step further: a
-[hook](integrations/claude-code/README.md) fetches the attachment the moment
-you press Enter, so Claude reads the file instead of first deciding to run the
-command.
+Files go into a private inbox under the user's home directory. Directories are `0700`, files are `0600`.
 
-### 3. Paste
+Clift reads the clipboard once, when you paste. It does not watch the clipboard and keeps no clipboard history.
 
-Take a screenshot, then in the terminal that is talking to your server press
-the key you chose in setup (`Cmd+Shift+V` on macOS and `Ctrl+Alt+V` on Windows
-unless you changed it), or run `clift paste --copy` and paste. One line lands
-in the session:
+---
+
+# Fast Mode and Universal Mode
+
+Clift has two ways to transfer files.
+
+|                       | **Fast Mode**                        | **Universal Mode**                                              |
+| --------------------- | ------------------------------------ | --------------------------------------------------------------- |
+| Good for              | SSH servers you have already set up  | Switching servers often, temporary machines, many remotes       |
+| How the target is set | Clift uses the configured SSH target | Whichever server the token is pasted into fetches the file      |
+| Transfer              | SSH / SFTP, direct                   | Encrypted locally → relay → fetched by the server               |
+| Relay                 | Not needed                           | Needed                                                          |
+| Clift on the server   | Not needed                           | Needed                                                          |
+| SSH config changes    | Not needed                           | Not needed                                                      |
+| Daemon on the server  | Not needed                           | Not needed                                                      |
+| When to use           | Default                              | When you want "the current session decides the target"          |
+
+If your servers are already in `~/.ssh/config`, use Fast Mode first.
+
+Universal Mode solves a different problem:
+
+> I don't want Clift on my laptop to know in advance which server this is going to.
+
+---
+
+# Universal Mode
+
+In Fast Mode, your laptop picks the target.
+
+In Universal Mode, the **current terminal session** decides.
+
+When you press the shortcut, your laptop produces a line like this:
 
 ```text
 Attachment: clift fetch 'clift://v1/…'
 ```
 
-The agent runs it and gets the file. No target to choose, no `ssh` config to
-edit, no plugin to install.
+Whichever server you paste it into can fetch the attachment.
 
-### 4. Bring something back
+Your laptop doesn't need to know about that server beforehand.
 
-The same key works the other way. On the server, name a file:
+---
+
+## 1. Get a relay
+
+Universal Mode needs a relay.
+
+The relay only holds the encrypted attachment for a while. You can run `clift-relayd` yourself, or deploy one to your own Cloudflare account:
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/leazoot/clift/tree/main/relay/cloudflare)
+
+Once you have the address, for example:
+
+```text
+https://clift-relay.<you>.workers.dev
+```
+
+---
+
+## 2. Set up the server
+
+Universal Mode doesn't need you to register servers **on your laptop**, but a server that receives attachments needs `clift` installed and the relay address.
+
+### Let the agent install and configure it (recommended)
+
+Send this to the agent running on the server, with your relay address filled in:
+
+```text
+Set up Clift on this server so I can paste screenshots to you.
+
+RELAY_URL: https://clift-relay.<you>.workers.dev
+
+Follow https://raw.githubusercontent.com/leazoot/clift/main/install.md exactly:
+fetch it, work through its TODO list in order, stop and show me the error if a
+step fails, and report as its last step says.
+```
+
+### By hand
+
+Linux / macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/install.sh | sh -s -- --no-setup
+
+clift config set relay.url https://clift-relay.<you>.workers.dev
+
+clift doctor
+```
+
+If you want the agent to recognise Clift tokens, add the instructions to the agent's instructions file.
+
+Claude Code:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> CLAUDE.md
+```
+
+Codex:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leazoot/clift/main/integrations/agents/clift.md >> AGENTS.md
+```
+
+For other agents, append it to whichever instructions file the agent actually reads, for example:
+
+```text
+GEMINI.md
+AGENTS.md
+CLAUDE.md
+```
+
+The relay address is not in the token, so every receiving server needs the relay address set once.
+
+---
+
+## 3. Paste
+
+After taking a screenshot, press the shortcut in the SSH session.
+
+Universal Mode doesn't upload to an SSH host. It types:
+
+```text
+Attachment: clift fetch 'clift://v1/…'
+```
+
+The server runs:
+
+```bash
+clift fetch 'clift://v1/…'
+```
+
+On success it prints the file's path on the server, and the agent can read it.
+
+You never tell Clift on your laptop which machine you're connected to.
+
+---
+
+## Claude Code hook (optional)
+
+If you use Claude Code, you can install a hook for it:
+
+[Claude Code integration](integrations/claude-code/README.md)
+
+With it installed, the token is fetched when you submit, so Claude doesn't have to decide to run `clift fetch` first.
+
+---
+
+# Bringing an image back from the server
+
+Universal Mode also works the other way.
+
+On the server:
 
 ```console
 $ clift copy build/report.png
 clift://v1/…
 ```
 
-Select that line and copy it the way you copy anything in your terminal, then
-press the key at home. The picture is on your clipboard, ready to paste
-anywhere.
-
-This is for the case where you cannot reach the server from where you are
-sitting. When you can, `scp` is shorter and Clift will tell you so.
-
-## How Universal Mode works
+Copy the token it returns:
 
 ```text
- laptop                        relay                         server
- ──────                        ─────                         ──────
- clipboard ──seal──▶ ciphertext ──▶ stored 5 min ──▶ ciphertext ──open──▶ inbox/
-             key ─────────────────────────────────────────────▶ key
-                     (inside the token you paste; never sent to the relay)
+clift://v1/…
 ```
 
-- Every attachment is sealed with a fresh **XChaCha20-Poly1305** key and nonce.
-- The relay stores bytes it cannot read, returns them **exactly once**, and forgets them.
-- The key travels in the token's fragment (`#…`), the part of a URL that is
-  never sent to a server.
-- `clift fetch` decrypts, checks every byte, and writes the file `0600` into a
-  `0700` directory. If anything fails it writes nothing and says why.
+Then press the Clift shortcut on your laptop.
 
-Plain text is never touched: paste it and it pastes as it always did.
+The image goes onto your local clipboard, and you can paste it into a browser, a chat app or anything else.
 
-## Commands
+If you can easily pull the file with `scp` / `sftp`, that is usually simpler. This is for when you're already working in the terminal and don't want to deal with a separate file transfer (honestly, it's not that useful).
 
-| Command | What it does |
-| --- | --- |
-| `clift setup` | First-time questions; with `<ssh-host>`, verify a Fast Mode host and remember it |
-| `clift paste [--copy\|--inject]` | Send the clipboard and hand you the text to paste |
-| `clift fetch '<token>' [--copy]` | Redeem a token: print the file's path, or put the picture on your clipboard |
-| `clift copy <file…>` | On the server: seal a file and print a token to paste at home |
-| `clift hotkey [--install]` | One key combination, in any application |
-| `clift send [files…] [--to <target>]` | Fast Mode: send files or `--clipboard` over SSH |
-| `clift doctor` | Say exactly what would stop a send from working |
-| `clift status` · `clift config` · `clift clean` | Inspect, edit, tidy up |
+---
 
-Every command has `--json` for machines and a stable exit code per failure.
+# How Universal Mode works
 
-## Configuration
+```text
+ Laptop                         Relay                         Server
+─────────                     ─────────                     ─────────
 
-`~/.config/clift/config.toml` on macOS and Linux, `%APPDATA%\Clift\config.toml`
-on Windows. A few lines, no secrets anywhere in it:
+Clipboard
+    │
+    │  XChaCha20-Poly1305
+    ▼
+Ciphertext ───────────────────▶ store
+                                  │
+                                  │ ciphertext
+                                  ▼
+                              clift fetch
+                                  │
+                                  ▼
+                               decrypt
+                                  │
+                                  ▼
+                                inbox/
+
+
+Encryption key ─────── inside pasted Token ───────────────▶ Server
+
+                    key is never sent to Relay
+```
+
+Every attachment uses a new **XChaCha20-Poly1305** key and nonce.
+
+The relay only gets encrypted data. The attachment's contents, file name and media type are all inside it.
+
+The key is in the token's URL fragment and is never sent to the relay.
+
+Note: by default an attachment can be fetched successfully only once. Anything not fetched expires.
+
+---
+
+# Other ways to install
+
+### Homebrew
+
+```bash
+brew install leazoot/clift/clift
+```
+
+### cargo-binstall
+
+```bash
+cargo binstall --git https://github.com/leazoot/clift clift-cli
+```
+
+### Releases
+
+Download the archive for your platform from
+
+[GitHub Releases](https://github.com/leazoot/clift/releases)
+
+### Build from source
+
+Needs Rust 1.95 or newer:
+
+```bash
+git clone https://github.com/leazoot/clift.git
+cd clift
+cargo build --release
+```
+
+The Scoop manifest for Windows is in
+
+[`packaging/`](packaging/)
+
+---
+
+# Common commands
+
+| Command                             | What it does                                    |
+| ----------------------------------- | ----------------------------------------------- |
+| `clift setup`                       | Interactive setup                               |
+| `clift setup <ssh-host>`            | Verify and save a Fast Mode SSH target          |
+| `clift paste`                       | Handle what's on the clipboard                  |
+| `clift paste --copy`                | Put the generated text on the clipboard         |
+| `clift paste --inject`              | Type the generated text into the current window |
+| `clift send [files…]`               | Send files in Fast Mode                         |
+| `clift send [files…] --to <target>` | Pick the Fast Mode target                       |
+| `clift fetch '<token>'`             | Fetch an attachment in Universal Mode           |
+| `clift fetch '<token>' --copy`      | Fetch an image onto the clipboard               |
+| `clift copy <file…>`                | Wrap a server file in a token you can take home |
+| `clift hotkey --install`            | Install the global shortcut helper              |
+| `clift doctor`                      | Check the current config and connection         |
+| `clift status`                      | Show the current status                         |
+| `clift config`                      | Show or change the config                       |
+| `clift clean`                       | Clean up Clift's files                          |
+
+Commands support `--json` output and errors have fixed exit codes, so scripts and agents can call them.
+
+---
+
+# Configuration
+
+Location:
+
+### macOS / Linux
+
+```text
+~/.config/clift/config.toml
+```
+
+### Windows
+
+```text
+%APPDATA%\Clift\config.toml
+```
+
+A Universal Mode config might look like:
 
 ```toml
 mode = "universal"
@@ -259,21 +488,162 @@ ttl = "5m"
 combination = "cmd+shift+v"
 ```
 
-## Security in one paragraph
+No attachment keys are stored in the config.
 
-Keys never leave the two machines at the ends. The relay sees ciphertext and an
-unguessable id, nothing else. It cannot decrypt, and it is not asked to
-authenticate anyone. Tokens are single use and expire. SSH is your own,
-unmodified. There is no telemetry, no account, no public relay, and no address
-compiled into the binary. What Clift does not defend against, such as a
-malicious process running as you or the server's root, is written down in
-[THREAT_MODEL.md](THREAT_MODEL.md).
+---
 
-## Contributing
+# Troubleshooting
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go through
-[SECURITY.md](SECURITY.md).
+Run this first:
 
-## Licence
+```bash
+clift doctor
+```
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+It checks what the current mode needs and shows where it fails.
+
+### SSH works, but Clift can't send
+
+Verify the target again:
+
+```bash
+clift setup core
+```
+
+Clift needs both SSH and SFTP to work.
+
+### The SSH host key changed
+
+Clift won't bypass host key verification.
+
+Check whether the change is legitimate first, then handle it the way you normally manage OpenSSH.
+
+### On macOS you have to press Cmd+V after the shortcut
+
+The shortcut helper doesn't have Accessibility permission, so it can only put the text on the clipboard.
+
+The permission has to go to the `clift` program itself, not your terminal. The `program:` line printed by `clift hotkey --install` is its path, `~/.local/bin/clift` by default.
+
+Add it here:
+
+```text
+System Settings
+→ Privacy & Security
+→ Accessibility
+```
+
+Then run again:
+
+```bash
+clift hotkey --install
+```
+
+### Universal Mode can't fetch an attachment
+
+Check the relay config on both ends:
+
+```bash
+clift status
+clift doctor
+```
+
+A token works only once, and it expires.
+
+---
+
+# Why not just use scp?
+
+Clift is for a different situation:
+
+> The image has just landed on your clipboard, and your hands are still in a Claude Code / Codex SSH session.
+
+It saves you:
+
+```text
+Save the image
+→ Find the file
+→ Think of a path
+→ scp
+→ Work out the remote path
+→ Send the path to the agent
+```
+
+and turns it into:
+
+```text
+Screenshot
+→ Shortcut
+```
+
+---
+
+# Why two modes?
+
+Fast Mode and Universal Mode are not a "lite" and a "full" version.
+
+They are two different ways of choosing the target.
+
+### Fast Mode
+
+Your laptop knows the target:
+
+```text
+This goes to core.
+```
+
+So it can go straight over SSH / SFTP.
+
+### Universal Mode
+
+Your laptop doesn't know the target, and doesn't need to:
+
+```text
+Whichever machine I paste the token into fetches it.
+```
+
+So a relay holds the ciphertext for a while.
+
+Most of the time, **Fast Mode is enough**.
+
+Use Universal Mode only when "the current session decides the target" is more convenient than "the laptop has the target configured".
+
+---
+
+# Privacy
+
+Clift has:
+
+* No account system
+* No telemetry
+* No clipboard watching
+* No clipboard history
+* No third-party service in Fast Mode
+* No public relay hard-coded into the client
+
+---
+
+# Contributing
+
+How to develop and contribute:
+
+[CONTRIBUTING.md](CONTRIBUTING.md)
+
+Found a security issue:
+
+[SECURITY.md](SECURITY.md)
+
+Security model:
+
+[THREAT_MODEL.md](THREAT_MODEL.md)
+
+## Links
+
+- [LINUX DO](https://linux.do/)
+
+---
+
+# License
+
+Apache-2.0
+
+See [LICENSE](LICENSE) and [NOTICE](NOTICE).
