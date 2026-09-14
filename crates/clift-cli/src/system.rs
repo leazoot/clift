@@ -55,13 +55,8 @@ pub fn transport(config: &Config, reporter: &Reporter) -> OpenSshTransport {
             OpenSshTransport::with_runner(runner.with_reuse(reuse))
         }
         Err(error) => {
-            let carrying_on = if runner.keeps_sessions() {
-                "carrying on with one sftp session per run"
-            } else {
-                "and each operation runs its own sftp"
-            };
             reporter.verbose(&format!(
-                "connection reuse unavailable, {carrying_on}: {}",
+                "connection reuse unavailable, carrying on with one sftp session per run: {}",
                 error.message()
             ));
             OpenSshTransport::with_runner(runner)

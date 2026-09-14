@@ -169,7 +169,6 @@ Clift 使用的就是你已经配置好的：
 
 ```text
 ssh
-sftp
 ~/.ssh/config
 known_hosts
 SSH Agent / 系统认证方式

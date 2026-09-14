@@ -1,20 +1,23 @@
 //! Uploading one file so that a half-written one can never be read.
 //!
-//! The bytes go to a temporary name, the size is verified, and only
-//! then is the file renamed into place. An agent watching the batch directory
-//! sees the file appear complete or not at all.
+//! The bytes go to a temporary name, the size is verified, and only then is
+//! the file renamed into place. An agent watching the batch directory sees the
+//! file appear complete or not at all.
 //!
-//! Two round trips are the floor here, and the reason is worth stating: the
-//! size has to be checked *before* the rename, and an SFTP batch cannot branch
-//! on a result. Doing it in one batch would mean renaming first and checking
-//! afterwards, which is exactly the half-written file this exists to prevent.
+//! The temporary file is created exclusively and made private on its open
+//! handle before its first byte, so there is no moment at which it exists with
+//! looser permissions. Clift reads the local file itself and sends it in
+//! pieces, which is also why a local path never has to be spelled in a form
+//! some other program understands.
 
-use crate::errmap::map_failure;
+use crate::errmap::map_refusal;
 use crate::probe::OpenSshTransport;
-use crate::proc::SftpBatch;
+use crate::session::Failure;
+use crate::wire::Attrs;
 use clift_core::domain::RemotePath;
 use clift_core::error::{CliftError, ErrorKind, Remedy, Stage};
 use clift_core::ports::{RemoteUpload, TransportTarget};
+use std::fs::File;
 use std::path::Path;
 
 /// Permissions of an uploaded attachment. The remote account's own files, and
@@ -39,123 +42,102 @@ impl OpenSshTransport {
         source: &Path,
         destination: &RemotePath,
     ) -> Result<u64, CliftError> {
-        let expected = std::fs::metadata(source)
-            .map_err(|error| {
-                CliftError::new(
-                    Stage::Transfer,
-                    ErrorKind::Transfer,
-                    format!("could not read {}", source.display()),
-                )
-                .with_source(error)
-            })?
-            .len();
-
-        let Some(local) = source.to_str() else {
-            return Err(CliftError::new(
-                Stage::Transfer,
-                ErrorKind::Transfer,
-                format!(
-                    "{} is not valid UTF-8 and cannot be named to sftp",
-                    source.display()
-                ),
-            ));
-        };
-
-        let temporary = temporary_path(destination)?;
-        let uploaded = self.upload_to_temporary(target, local, &temporary, expected);
-        match uploaded {
-            Ok(()) => {}
-            Err(error) => {
-                self.discard(target, &temporary);
-                return Err(error);
-            }
-        }
-
-        let mut batch = SftpBatch::new();
-        batch.push("rename", &[temporary.as_str(), destination.as_str()])?;
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if !outcome.succeeded() {
-            self.discard(target, &temporary);
-            return Err(map_failure(
-                target,
-                Stage::Transfer,
-                "could not put the uploaded file in place",
-                &outcome.stderr,
-            ));
-        }
-        Ok(expected)
-    }
-
-    /// Sends the bytes, tightens the permissions and reads the size back, in
-    /// one round trip.
-    fn upload_to_temporary(
-        &self,
-        target: &TransportTarget,
-        local: &str,
-        temporary: &RemotePath,
-        expected: u64,
-    ) -> Result<(), CliftError> {
-        let mut batch = SftpBatch::new();
-        batch.push("put", &[local, temporary.as_str()])?;
-        // Before anything else can see it: `put` leaves the local file's mode,
-        // which is whatever the screenshot tool chose.
-        batch.push("chmod", &[&format!("{FILE_MODE:o}"), temporary.as_str()])?;
-        batch.push("ls", &["-l", temporary.as_str()])?;
-
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if !outcome.succeeded() {
-            return Err(map_failure(
-                target,
-                Stage::Transfer,
-                "could not upload the attachment",
-                &outcome.stderr,
-            ));
-        }
-
-        let reported = listed_size(&outcome.stdout, temporary).ok_or_else(|| {
+        let unreadable = |error: std::io::Error| {
             CliftError::new(
                 Stage::Transfer,
                 ErrorKind::Transfer,
-                format!(
-                    "{} did not report the size of the uploaded file",
-                    target.ssh_host()
-                ),
+                format!("could not read {}", source.display()),
             )
-        })?;
+            .with_source(error)
+        };
+        let mut file = File::open(source).map_err(unreadable)?;
+        let expected = file.metadata().map_err(unreadable)?.len();
+        let temporary = temporary_path(destination)?;
 
-        verify_size(target, expected, reported)
-    }
+        let outcome = self.runner().sftp(target, |session| {
+            let attrs = match session.upload(&mut file, temporary.as_str(), FILE_MODE) {
+                Ok(attrs) => attrs,
+                Err(failure @ Failure::Broken { .. }) => return Err(failure),
+                Err(failure) => {
+                    // The reason the upload failed is what the user needs;
+                    // whether the tidying up worked is not, and a leftover
+                    // `.part` is what cleanup exists for.
+                    let _ = session.remove(temporary.as_str());
+                    return Err(failure);
+                }
+            };
+            if let Err(wrong) = verify(target, expected, attrs) {
+                let _ = session.remove(temporary.as_str());
+                return Ok(Err(wrong));
+            }
+            match session.rename(temporary.as_str(), destination.as_str()) {
+                Ok(()) => Ok(Ok(expected)),
+                Err(Failure::Refused(refusal)) => {
+                    let _ = session.remove(temporary.as_str());
+                    Ok(Err(map_refusal(
+                        target,
+                        Stage::Transfer,
+                        "could not put the uploaded file in place",
+                        refusal.code,
+                        &refusal.message,
+                    )))
+                }
+                Err(other) => Err(other),
+            }
+        });
 
-    /// Removes an intermediate file, ignoring whatever happens.
-    ///
-    /// A cleanup failure must not replace the error that caused it: the user
-    /// needs to know why the upload failed, not why the tidying up did.
-    fn discard(&self, target: &TransportTarget, temporary: &RemotePath) {
-        let mut batch = SftpBatch::new();
-        if batch.push("rm", &[temporary.as_str()]).is_ok() {
-            let _ = self.runner().run_sftp(target, &batch);
+        match outcome {
+            Ok(verdict) => verdict,
+            Err(failure) => Err(self.runner().session_error(
+                target,
+                Stage::Transfer,
+                "could not upload the attachment",
+                failure,
+            )),
         }
     }
 }
 
-/// Refuses a file whose remote size does not match the local one.
+/// Refuses a file whose remote size or permissions are not what was sent.
 ///
-/// It takes no path, and that is deliberate rather than incidental: the specification
-/// forbids naming a remote file that is about to be deleted, and a
-/// function that never receives the path cannot leak it into the message.
-fn verify_size(target: &TransportTarget, expected: u64, reported: u64) -> Result<(), CliftError> {
-    if reported == expected {
-        return Ok(());
+/// It takes no path, and that is deliberate rather than incidental: the
+/// specification forbids naming a remote file that is about to be deleted,
+/// and a function that never receives the path cannot leak it into the
+/// message.
+fn verify(target: &TransportTarget, expected: u64, attrs: Attrs) -> Result<(), CliftError> {
+    let Some(reported) = attrs.size else {
+        return Err(CliftError::new(
+            Stage::Transfer,
+            ErrorKind::Transfer,
+            format!(
+                "{} did not report the size of the uploaded file",
+                target.ssh_host()
+            ),
+        ));
+    };
+    if reported != expected {
+        return Err(CliftError::new(
+            Stage::Transfer,
+            ErrorKind::Transfer,
+            format!("the upload was truncated: {expected} bytes were sent, {reported} arrived"),
+        )
+        .with_remedy(Remedy::new(
+            "Check the connection and the remote free space, then send again:",
+            format!("ssh {} df -h ~", target.ssh_host()),
+        )));
     }
-    Err(CliftError::new(
-        Stage::Transfer,
-        ErrorKind::Transfer,
-        format!("the upload was truncated: {expected} bytes were sent, {reported} arrived"),
-    )
-    .with_remedy(Remedy::new(
-        "Check the connection and the remote free space, then send again:",
-        format!("ssh {} df -h ~", target.ssh_host()),
-    )))
+    match attrs.permissions.map(|bits| bits & 0o777) {
+        Some(FILE_MODE) => Ok(()),
+        other => Err(CliftError::new(
+            Stage::Transfer,
+            ErrorKind::RemoteDirectory,
+            format!(
+                "{} left the uploaded file with mode {}, not {FILE_MODE:04o}",
+                target.ssh_host(),
+                other.map_or_else(|| "unknown".to_string(), |bits| format!("{bits:04o}"))
+            ),
+        )),
+    }
 }
 
 /// The intermediate name, alongside the destination.
@@ -186,16 +168,6 @@ fn temporary_path(destination: &RemotePath) -> Result<RemotePath, CliftError> {
         .map_err(|error| error.into_clift(Stage::Transfer, ErrorKind::Internal))
 }
 
-/// The size `sftp` reported for a path in its `ls -l` output.
-fn listed_size(stdout: &str, path: &RemotePath) -> Option<u64> {
-    let wanted = path.as_str().rsplit('/').next()?;
-    stdout
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("sftp>"))
-        .filter(|line| line.trim_end().ends_with(wanted))
-        .find_map(|line| line.split_whitespace().nth(4)?.parse::<u64>().ok())
-}
-
 impl RemoteUpload for OpenSshTransport {
     fn upload_atomic(
         &self,
@@ -214,6 +186,14 @@ mod tests {
     fn destination() -> RemotePath {
         RemotePath::new("/home/dev/.cache/clift/inbox/2026-08-30/abc/shot.png")
             .unwrap_or_else(|error| panic!("bad test path: {error}"))
+    }
+
+    fn arrived(size: Option<u64>, bits: u32) -> Attrs {
+        Attrs {
+            size,
+            permissions: Some(bits),
+            mtime: None,
+        }
     }
 
     #[test]
@@ -245,25 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn the_size_is_read_from_the_line_for_that_file() {
-        let path = RemotePath::new("/home/dev/batch/.0011223344556677.part")
-            .unwrap_or_else(|error| panic!("bad test path: {error}"));
-        let stdout = concat!(
-            "sftp> put \"/tmp/shot.png\" \"/home/dev/batch/.0011223344556677.part\"\n",
-            "sftp> ls -l \"/home/dev/batch/.0011223344556677.part\"\n",
-            "-rw-------    ? dev      dev        182734 Aug 30 12:34 ",
-            "/home/dev/batch/.0011223344556677.part\n"
-        );
-        assert_eq!(listed_size(stdout, &path), Some(182_734));
-    }
-
-    #[test]
     fn a_size_mismatch_is_a_transfer_failure_that_names_no_remote_file() {
         let target = TransportTarget::new("core");
-        assert!(verify_size(&target, 182_734, 182_734).is_ok());
+        assert!(verify(&target, 182_734, arrived(Some(182_734), 0o100_600)).is_ok());
+        assert!(
+            verify(&target, 0, arrived(Some(0), 0o100_600)).is_ok(),
+            "zero bytes is a size like any other"
+        );
 
-        let error =
-            verify_size(&target, 182_734, 9_216).expect_err("a short arrival must not be accepted");
+        let error = verify(&target, 182_734, arrived(Some(9_216), 0o100_600))
+            .expect_err("a short arrival must not be accepted");
         assert_eq!(error.exit_code().as_u8(), 23);
         assert_eq!(error.stage(), Stage::Transfer);
 
@@ -283,11 +254,11 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_byte_file_reports_zero_rather_than_nothing() {
-        let path = RemotePath::new("/home/dev/batch/.aabbccddeeff0011.part")
-            .unwrap_or_else(|error| panic!("bad test path: {error}"));
-        let stdout = "-rw-------    ? dev      dev             0 Aug 30 12:34 \
-                      /home/dev/batch/.aabbccddeeff0011.part\n";
-        assert_eq!(listed_size(stdout, &path), Some(0));
+    fn an_upload_without_a_size_or_with_loose_permissions_is_refused() {
+        let target = TransportTarget::new("core");
+        assert!(verify(&target, 10, arrived(None, 0o100_600)).is_err());
+        let loose = verify(&target, 10, arrived(Some(10), 0o100_644)).unwrap_err();
+        assert_eq!(loose.exit_code().as_u8(), 25);
+        assert!(loose.message().contains("0644"), "{loose}");
     }
 }

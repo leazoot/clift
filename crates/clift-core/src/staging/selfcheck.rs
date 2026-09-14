@@ -52,14 +52,7 @@ pub fn verify_round_trip(
     }
 
     match remote.stat(target, &destination)? {
-        // Only the bits the listing showed can be compared. The Windows build
-        // of OpenSSH's sftp shows the owner's and hides group and other.
-        Some(entry)
-            if entry.mode.is_some_and(|mode| {
-                (mode & 0o777 & !entry.hidden_mode_bits)
-                    != (REQUIRED_MODE & !entry.hidden_mode_bits)
-            }) =>
-        {
+        Some(entry) if entry.mode.is_some_and(|mode| mode & 0o777 != REQUIRED_MODE) => {
             return Err(failed(
                 target,
                 "the uploaded file did not keep the permissions Clift set",

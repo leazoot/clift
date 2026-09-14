@@ -7,13 +7,13 @@
 //! more permissive attempt.
 
 use crate::errmap::{Symptom, classify};
-use crate::proc::{SftpBatch, SshRunner};
+use crate::proc::SshRunner;
+use crate::session::Failure;
 use clift_core::error::CliftError;
 use clift_core::ports::{CheckStatus, ProbeCheck, ProbeReport, TransportTarget};
 
 /// Names of the checks a probe reports, in the order they are attempted.
 pub const CHECK_SSH_CLIENT: &str = "ssh client";
-pub const CHECK_SFTP_CLIENT: &str = "sftp client";
 pub const CHECK_CONNECTION: &str = "connection";
 pub const CHECK_HOST_KEY: &str = "host key";
 pub const CHECK_AUTHENTICATION: &str = "authentication";
@@ -83,8 +83,10 @@ impl OpenSshTransport {
         Ok(report)
     }
 
+    /// Only `ssh` is needed: SFTP is spoken over it, so no separate `sftp`
+    /// program has to be installed.
     fn check_clients(&self, report: &mut ProbeReport) -> bool {
-        let ssh = match self.runner.ssh_version() {
+        match self.runner.ssh_version() {
             Ok(version) => {
                 report
                     .checks
@@ -97,22 +99,7 @@ impl OpenSshTransport {
                     .push(fail(CHECK_SSH_CLIENT, error.message().to_string()));
                 false
             }
-        };
-        let sftp = match self.runner.sftp_present() {
-            Ok(()) => {
-                report
-                    .checks
-                    .push(pass(CHECK_SFTP_CLIENT, "found".to_string()));
-                true
-            }
-            Err(error) => {
-                report
-                    .checks
-                    .push(fail(CHECK_SFTP_CLIENT, error.message().to_string()));
-                false
-            }
-        };
-        ssh && sftp
+        }
     }
 
     /// Runs one `ssh <host> true`, then reports what its outcome proves about
@@ -215,24 +202,33 @@ impl OpenSshTransport {
         target: &TransportTarget,
         report: &mut ProbeReport,
     ) -> Result<(), CliftError> {
-        let mut batch = SftpBatch::new();
-        batch.push("pwd", &[])?;
-        let outcome = self.runner.run_sftp(target, &batch)?;
-        if outcome.succeeded() {
-            report
-                .checks
-                .push(pass(CHECK_SFTP_SUBSYSTEM, "available".to_string()));
-            return Ok(());
-        }
+        // Opening a session is the whole check: the greeting only completes
+        // when the server has started its SFTP subsystem and answered in it.
+        let failure = match self.runner.sftp(target, |_session| Ok(())) {
+            Ok(()) => {
+                report
+                    .checks
+                    .push(pass(CHECK_SFTP_SUBSYSTEM, "available".to_string()));
+                return Ok(());
+            }
+            Err(failure) => failure,
+        };
 
-        let stderr = outcome.stderr.trim();
-        let detail = if classify(stderr) == Symptom::SftpSubsystemMissing {
-            format!(
-                "the server accepted the login but does not offer the SFTP subsystem. \
-                 OpenSSH reported: {stderr}"
-            )
-        } else {
-            stderr.to_string()
+        let detail = match failure {
+            Failure::Broken { stderr, reason, .. } => {
+                let stderr = stderr.trim();
+                if classify(stderr) == Symptom::SftpSubsystemMissing {
+                    format!(
+                        "the server accepted the login but does not offer the SFTP subsystem. \
+                         OpenSSH reported: {stderr}"
+                    )
+                } else if stderr.is_empty() {
+                    reason
+                } else {
+                    stderr.to_string()
+                }
+            }
+            other => other.to_string(),
         };
         report.checks.push(ProbeCheck {
             name: CHECK_SFTP_SUBSYSTEM.to_string(),

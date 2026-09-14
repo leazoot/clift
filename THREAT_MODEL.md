@@ -116,22 +116,17 @@ above:
    because that is the entire point.
 4. **Anything on a shared account.** If several people use one login, they can
    all read each other's attachments. Do not use Clift there.
-5. **The instant between `mkdir` and `chmod`.** The `sftp` client has no way to
-   create a directory with a mode, so every directory Clift makes exists for
-   one round trip with the remote umask, typically `0775`. Batch and date
-   directories are inside an inbox that is already `0700`, which closes the
-   window before it opens; the first creation of `~/.cache/clift` is the one
-   reachable case, and the directory is empty then. Closing it would mean
-   linking an SSH library or running a remote shell command, both of which
-   this document refuses above.
-6. **Group and other permissions, seen from Windows.** The Windows build of
-   OpenSSH's `sftp` client prints only the owner's permission bits and shows
-   group and other as `*`, so from a Windows computer `0700` and `0777` look the
-   same. Clift sets `0700` on every directory it creates and refuses a directory
-   whose owner bits are wrong, but an inbox that already existed with group or
-   other access cannot be caught from there. `setup` and `doctor` say so, with a
-   command that shows the full permissions on the host.
-7. **Bytes a server sends back.** `clift copy` on a remote machine and `clift
+5. **A server that ignores the mode sent with `mkdir`.** Clift asks for `0700`
+   in the same request that creates a directory, and uploads are opened with
+   `0600` and made private before their first byte. OpenSSH's server applies
+   the requested mode as it creates the directory, so there is no moment at
+   which it is looser. A server that ignores the request creates the directory
+   with its umask, typically `0775`, and it stays that way for the one round
+   trip it takes Clift to read the mode back and correct it. Batch and date
+   directories are inside an inbox that is already `0700`, which closes that
+   window before it opens; the first creation of `~/.cache/clift` on such a
+   server is the one reachable case, and the directory is empty then.
+6. **Bytes a server sends back.** `clift copy` on a remote machine and `clift
    fetch --copy` at home reverse the direction, and the picture that reaches
    the local clipboard came from the far end. The relay cannot substitute it:
    altering one byte of the ciphertext makes the whole object fail to

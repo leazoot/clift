@@ -1,4 +1,4 @@
-//! The thirteen checks of the specification.
+//! The twelve checks of the specification.
 //!
 //! Two rules shape this module. **No check stops another**: a user with three
 //! problems should learn about all three in one run, not discover them one
@@ -16,7 +16,7 @@ use crate::ports::{
     CheckStatus, ClipboardSource, Randomness, Relay, RemoteFs, RemoteUpload, SshConfigSource,
     TransportTarget,
 };
-use crate::staging::{InboxLocation, ensure_inbox, partly_checked_permissions, verify_round_trip};
+use crate::staging::{ensure_inbox, verify_round_trip};
 use crate::universal::RelaySettings;
 use crate::universal::crypto::{self, NONCE_BYTES};
 use crate::universal::token::{SEAL_KEY_BYTES, SealKey};
@@ -30,7 +30,6 @@ pub enum CheckName {
     Platform,
     Clipboard,
     SshClient,
-    SftpClient,
     HostResolution,
     Authentication,
     SftpSubsystem,
@@ -48,11 +47,10 @@ pub enum CheckName {
 
 impl CheckName {
     /// Every check, in report order.
-    pub const ALL: [CheckName; 13] = [
+    pub const ALL: [CheckName; 12] = [
         CheckName::Platform,
         CheckName::Clipboard,
         CheckName::SshClient,
-        CheckName::SftpClient,
         CheckName::HostResolution,
         CheckName::Authentication,
         CheckName::SftpSubsystem,
@@ -71,7 +69,6 @@ impl CheckName {
             CheckName::Platform => "platform",
             CheckName::Clipboard => "clipboard",
             CheckName::SshClient => "ssh client",
-            CheckName::SftpClient => "sftp client",
             CheckName::HostResolution => "host resolution",
             CheckName::Authentication => "authentication",
             CheckName::SftpSubsystem => "sftp subsystem",
@@ -242,7 +239,6 @@ pub fn diagnose(environment: &Environment<'_>, target: Option<&TransportTarget>)
     let Some(target) = target else {
         for name in [
             CheckName::SshClient,
-            CheckName::SftpClient,
             CheckName::HostResolution,
             CheckName::Authentication,
             CheckName::SftpSubsystem,
@@ -463,7 +459,6 @@ fn remote_checks(environment: &Environment<'_>, target: &TransportTarget) -> Vec
             // check inside it failing. Say so once, for each check it covers.
             for name in [
                 CheckName::SshClient,
-                CheckName::SftpClient,
                 CheckName::HostResolution,
                 CheckName::Authentication,
                 CheckName::SftpSubsystem,
@@ -493,12 +488,6 @@ fn remote_checks(environment: &Environment<'_>, target: &TransportTarget) -> Vec
         &probe,
         CheckName::SshClient,
         "ssh client",
-        &host,
-    ));
-    checks.push(from_probe(
-        &probe,
-        CheckName::SftpClient,
-        "sftp client",
         &host,
     ));
     checks.push(host_resolution(environment, &host));
@@ -540,7 +529,12 @@ fn remote_checks(environment: &Environment<'_>, target: &TransportTarget) -> Vec
                 CheckName::RemoteHome,
                 location.home().as_str().to_string(),
             ));
-            checks.push(inbox_permissions(environment.remote, target, &location));
+            let mut detail = format!("{} is private (0700)", location.root());
+            if let Some(warning) = location.warning() {
+                detail.push_str("; ");
+                detail.push_str(&warning);
+            }
+            checks.push(pass(CheckName::InboxPermissions, detail));
 
             match verify_round_trip(
                 environment.remote,
@@ -562,48 +556,6 @@ fn remote_checks(environment: &Environment<'_>, target: &TransportTarget) -> Vec
     }
 
     checks
-}
-
-/// The inbox check, which can vouch only for what this computer's sftp client
-/// shows. The Windows build of OpenSSH's sftp shows the owner's permission bits
-/// and hides the rest, and a check that passed on half the bits must not read
-/// as if it had seen all of them.
-fn inbox_permissions(
-    remote: &dyn RemoteFs,
-    target: &TransportTarget,
-    location: &InboxLocation,
-) -> DoctorCheck {
-    let host = target.ssh_host().to_string();
-    let root = location.root();
-    let (status, mut detail, remedy) = match partly_checked_permissions(remote, target, root) {
-        Ok(None) => (CheckStatus::Pass, format!("{root} is private (0700)"), None),
-        Ok(Some(partly)) => (
-            CheckStatus::Warn,
-            format!("the owner's part of {root} is private (0700); {partly}"),
-            Some(Remedy::new(
-                "See all of its permissions on the host:",
-                format!("ssh {host} ls -ld '{root}'"),
-            )),
-        ),
-        Err(error) => {
-            let remedy = error.remedy().cloned().unwrap_or_else(|| ssh_remedy(&host));
-            return fail(
-                CheckName::InboxPermissions,
-                error.message().to_string(),
-                remedy,
-            );
-        }
-    };
-    if let Some(warning) = location.warning() {
-        detail.push_str("; ");
-        detail.push_str(&warning);
-    }
-    DoctorCheck {
-        name: CheckName::InboxPermissions,
-        status,
-        detail,
-        remedy,
-    }
 }
 
 /// `ssh -G` resolving the alias, which is a different failure from the host

@@ -167,34 +167,6 @@ pub fn ensure_inbox(
     Ok(location)
 }
 
-/// What this computer's sftp client could not show about the inbox, if anything.
-///
-/// The Windows build of OpenSSH's `sftp` shows the owner's permission bits and
-/// hides group and other, so from there an inbox can be confirmed private to
-/// its owner but not closed to everyone else. Every directory Clift creates is
-/// set to `0700` by Clift itself, so a fresh inbox is still what it should be;
-/// this exists so that an inbox which was already there is never reported as
-/// checked in full.
-///
-/// # Errors
-/// Fails when the host cannot be reached.
-pub fn partly_checked_permissions(
-    remote: &dyn RemoteFs,
-    target: &TransportTarget,
-    root: &RemotePath,
-) -> Result<Option<String>, CliftError> {
-    let hidden = remote
-        .stat(target, root)?
-        .map_or(0, |entry| entry.hidden_mode_bits);
-    if hidden == 0 {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "the sftp client on this computer does not show group and other permissions, \
-         so only the owner's part of {root} could be checked"
-    )))
-}
-
 /// The configured location, when it is one that changes anything.
 ///
 /// The default string is what every configuration written by `setup` contains,

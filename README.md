@@ -169,7 +169,6 @@ Clift uses what you already have set up:
 
 ```text
 ssh
-sftp
 ~/.ssh/config
 known_hosts
 SSH agent / system authentication

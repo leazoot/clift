@@ -1,598 +1,656 @@
-//! One `sftp` process, kept open across operations.
+//! One SFTP session over the system `ssh`, spoken in the protocol itself.
 //!
-//! Connection reuse ([`crate::reuse`], the specification) removed the cost of
-//! authenticating once per operation. It did not remove the cost of *starting*
-//! one: every `sftp` invocation asks the server for a fresh `sftp-server`
-//! subsystem, and on the reference host that costs seconds even over an
-//! established master. A single `clift send` runs eleven of them.
+//! `ssh -s <host> sftp` asks the server for its SFTP subsystem and then carries
+//! bytes both ways. Everything to do with reaching and trusting the host stays
+//! with `ssh`: the configuration, known_hosts, the agent, hardware keys,
+//! ProxyJump. What travels over the pipes is SFTP version 3 ([`crate::wire`]),
+//! which Clift writes and reads directly.
 //!
-//! Measured against that host: a command sent into a session that is already
-//! open costs 0.2 ms, while opening the session costs 4.15 s. The session
-//! count was therefore the whole remaining cost, which is what this module
-//! removes.
+//! # Why not the `sftp` program
 //!
-//! # How one process runs many batches
+//! Clift used to drive `sftp -b -` and read what it printed. That meant
+//! parsing text meant for people: permission columns, dates in the local time
+//! zone, echoed commands used as frame markers. On Windows it did not work at
+//! all as a session, because that build of `sftp` holds everything it writes
+//! to a pipe until it exits, so every operation became a new process and a new
+//! authentication: 55 seconds for one screenshot on a link where `ssh` itself
+//! takes under four. `ssh` passes the subsystem's bytes on as they arrive, on
+//! every platform, so one connection carries a whole run.
 //!
-//! `sftp -b -` reads commands from stdin and echoes each one back to stdout as
-//! `sftp> <command>` before running it. That echo is the frame marker: it is
-//! Clift's own text coming back, so the end of one command's output can be
-//! recognised rather than guessed at from timing.
+//! # Timeouts
 //!
-//! Two details make it work.
-//!
-//! **Every command is sent with a leading `-`**, which tells `sftp` to carry on
-//! after a failure instead of ending the session. A missing path is a normal
-//! answer here -- [`crate::probe::OpenSshTransport::stat`] is implemented by
-//! listing a parent that may not exist yet -- and without the prefix the first
-//! such answer would tear down the very session that is meant to be shared.
-//! Abort-on-first-failure is not lost, it moves here: [`SftpSession::run`]
-//! stops sending a batch at the first command that writes to stderr, which is
-//! where the one-shot client would have stopped too. That equivalence matters
-//! beyond tidiness -- `ensure_dir` sends `mkdir` and `chmod` as a pair, and a
-//! `chmod` that ran after its `mkdir` had failed would be Clift changing the
-//! permissions of a directory somebody else created.
-//!
-//! **The fence is an invalid command carrying a random token.** `sftp` rejects
-//! it locally, so it costs no round trip, and rejecting it produces both halves
-//! of the frame at once: the token echoed on stdout, which can be matched
-//! exactly, and `Invalid command.` on stderr, which closes the error half.
-//!
-//! The token is random rather than a fixed string on purpose. Standard output
-//! carries remote file names, and a name containing a newline could otherwise
-//! forge a frame marker -- the remote account is not a trusted source of text.
-//!
-//! # Not on Windows
-//!
-//! The Windows build of OpenSSH's `sftp` writes to a piped stdout only when it
-//! exits. Sent one command at a time with stdin left open, it answered each on
-//! stderr at once and printed nothing on stdout until stdin was closed. The
-//! echo this module frames on never arrives while such a session is alive, so
-//! `SshRunner::with_sessions` leaves sessions off there.
+//! Requests are written by a thread of their own and replies are read by
+//! another, so neither direction can block the caller. The caller waits for a
+//! reply with a limit; when the limit passes, `ssh` is stopped, which also ends
+//! any write that was stuck behind it. A session that has timed out or lost its
+//! connection is finished and must be dropped. Nothing here retries: whether a
+//! request that was already written reached the server cannot be known, and a
+//! `rename` sent twice is exactly what the specification forbids.
 
-use crate::proc::SftpBatch;
+use crate::wire::{self, Attrs, NameEntry, Reply};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Bytes of randomness in the frame token. The token only has to be
-/// unguessable by whoever can write file names on the remote host.
-const TOKEN_BYTES: usize = 8;
+/// Writes in flight at once during an upload. The same figure OpenSSH's own
+/// client uses: enough that a distant host is not waited on write by write,
+/// few enough that a refusal is noticed within a couple of megabytes.
+const WRITE_WINDOW: usize = 64;
 
-/// How often the streams are checked while a command is in flight.
-const POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// How long a finished `ssh` may take to hand over the last of its stderr.
+const STDERR_GRACE: Duration = Duration::from_secs(2);
 
-/// How long a stopped client's stdout may take to close. It closes as soon as
-/// the process is gone; the limit is for anything else still holding the pipe,
-/// and running out of it counts the command as sent.
-const END_OF_OUTPUT_WAIT: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-/// What `sftp` printed for one batch.
+/// The server declined a request, in its own words.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionOutcome {
-    pub stdout: String,
-    pub stderr: String,
-    /// Whether a command in the batch failed, in which case the rest were not
-    /// sent -- the same thing the one-shot client does with a batch script.
-    pub failed: bool,
-}
-
-/// Why a session could not carry a batch.
-///
-/// The distinction is the whole point of the type: `started` says whether any
-/// command may have reached the server, which is true from the moment `sftp`
-/// has read one. Nothing may be retried once it has, because retrying a partly
-/// executed batch is exactly the automatic mid-transfer retry that the
-/// specification forbids.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionError {
-    pub started: bool,
+pub struct Refusal {
+    pub code: u32,
     pub message: String,
 }
 
-impl SessionError {
-    fn before_anything_ran(message: impl Into<String>) -> Self {
-        Self {
-            started: false,
-            message: message.into(),
-        }
-    }
+/// Why a request did not get the answer it asked for.
+#[derive(Debug)]
+pub enum Failure {
+    /// The server answered, and the answer was no.
+    Refused(Refusal),
+    /// The connection could not carry the request. The session is finished.
+    Broken {
+        reason: String,
+        /// What `ssh` printed, which is where the actual cause usually is.
+        stderr: String,
+        timed_out: bool,
+    },
+    /// The local file being uploaded could not be read.
+    Local(std::io::Error),
+    /// `ssh` itself could not be started.
+    NotStarted(std::io::Error),
+}
 
-    fn midway(message: impl Into<String>) -> Self {
-        Self {
-            started: true,
-            message: message.into(),
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::Refused(refusal) => write!(f, "{}", refusal.message),
+            Failure::Broken { reason, .. } => f.write_str(reason),
+            Failure::Local(error) | Failure::NotStarted(error) => write!(f, "{error}"),
         }
     }
 }
 
-/// A live `sftp -b -` process.
+/// A live `ssh -s <host> sftp`.
 #[derive(Debug)]
 pub struct SftpSession {
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: Stream,
-    stderr: Stream,
-    /// The unfinished tail of each stream, kept between commands because a
-    /// frame marker can arrive split across two reads.
-    pending_out: Vec<u8>,
-    pending_err: Vec<u8>,
-    fence: String,
+    requests: Option<Sender<Vec<u8>>>,
+    replies: Receiver<Result<Vec<u8>, String>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_reader: JoinHandle<()>,
+    /// Replies that arrived while a different one was being waited for.
+    early: HashMap<u32, Reply>,
+    next_id: u32,
+    timeout: Duration,
+    /// When the operation in progress must have finished by.
+    deadline: Instant,
+    broken: bool,
 }
 
 impl SftpSession {
-    /// Starts `program` with `args` and waits for nothing: the first command
-    /// sent is what pays for the connection.
+    /// Starts `program` with `args` and completes the SFTP greeting.
+    ///
+    /// The greeting is where the connection is made, so this is also where a
+    /// rejected key, a changed host key or a missing subsystem shows up, in
+    /// `ssh`'s own words on [`Failure::Broken`].
     ///
     /// # Errors
-    /// Fails when the process cannot be started or its pipes cannot be taken.
-    pub fn open(
-        program: &Path,
-        args: &[OsString],
-        timestamps_in_utc: bool,
-    ) -> Result<Self, String> {
-        let mut command = Command::new(program);
-        command
+    /// Fails when the process cannot be started, when the connection fails,
+    /// and when the server does not speak version 3.
+    pub fn open(program: &Path, args: &[OsString], timeout: Duration) -> Result<Self, Failure> {
+        let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if timestamps_in_utc {
-            // Same reason as the one-shot path: `sftp` renders modification
-            // times with the client's own strftime, and only a pinned zone
-            // makes them readable back as an absolute instant.
-            command.env("TZ", "UTC0");
-        }
-        let mut child = command
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("could not start {}: {error}", program.display()))?;
+            .map_err(Failure::NotStarted)?;
 
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("the sftp client did not provide the expected pipes".to_string());
-        };
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: Stream::draining(stdout),
-            stderr: Stream::draining(stderr),
-            pending_out: Vec::new(),
-            pending_err: Vec::new(),
-            fence: fence_token(),
-        })
-    }
-
-    /// Runs every command in `batch`, stopping at the first failure.
-    ///
-    /// # Errors
-    /// Fails when the session can no longer be used. Whether anything ran
-    /// first is carried on the error, because it decides whether the caller
-    /// may start over.
-    pub fn run(
-        &mut self,
-        batch: &SftpBatch,
-        timeout: Duration,
-    ) -> Result<SessionOutcome, SessionError> {
-        let mut stdout = String::new();
-        let mut started = false;
-
-        for command in batch.commands() {
-            let frame = self.run_one(command, timeout, started)?;
-            started = true;
-            stdout.push_str(&frame.stdout);
-            if !frame.stderr.is_empty() {
-                return Ok(SessionOutcome {
-                    stdout,
-                    stderr: frame.stderr,
-                    failed: true,
-                });
-            }
-        }
-
-        Ok(SessionOutcome {
-            stdout,
-            stderr: String::new(),
-            failed: false,
-        })
-    }
-
-    /// Sends one command and returns everything it printed.
-    fn run_one(
-        &mut self,
-        command: &str,
-        timeout: Duration,
-        started: bool,
-    ) -> Result<Frame, SessionError> {
-        // The leading `-` on both lines: see the module documentation. It is
-        // what keeps an expected failure from ending the session.
-        let script = format!("-{command}\n-{}\n", self.fence);
-        let Some(stdin) = self.stdin.as_mut() else {
-            let message = "the sftp session has already been closed";
-            return Err(if started {
-                SessionError::midway(message)
-            } else {
-                SessionError::before_anything_ran(message)
+            return Err(Failure::Broken {
+                reason: "the ssh client did not provide the expected pipes".to_string(),
+                stderr: String::new(),
+                timed_out: false,
             });
         };
-        let written = stdin
-            .write_all(script.as_bytes())
-            .and_then(|()| stdin.flush());
-        if let Err(error) = written {
-            return Err(self.abandon(
-                started,
-                format!("could not write to the sftp session: {error}"),
+
+        let requests = spawn_writer(stdin);
+        let replies = spawn_reader(stdout);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let stderr_reader = spawn_stderr(stderr, Arc::clone(&captured));
+
+        let mut session = Self {
+            child,
+            requests: Some(requests),
+            replies,
+            stderr: captured,
+            stderr_reader,
+            early: HashMap::new(),
+            next_id: 0,
+            timeout,
+            deadline: Instant::now() + timeout,
+            broken: false,
+        };
+        session.send(wire::init())?;
+        let body = session.next_packet()?;
+        let version = wire::decode_version(&body).map_err(|error| session.protocol(&error))?;
+        if version != wire::VERSION {
+            return Err(session.fail(
+                format!(
+                    "the server speaks SFTP version {version}, and Clift speaks version {}",
+                    wire::VERSION
+                ),
+                false,
             ));
         }
+        Ok(session)
+    }
 
-        let deadline = Instant::now() + timeout;
-        loop {
-            self.pending_out.extend_from_slice(&self.stdout.take());
-            self.pending_err.extend_from_slice(&self.stderr.take());
+    /// Starts the clock for one operation.
+    ///
+    /// The limit covers the operation as a whole, the way it once covered a
+    /// whole `sftp` process, rather than each reply: a transfer that keeps
+    /// making progress but will not finish in time is stopped just the same.
+    pub fn start_operation(&mut self) {
+        self.deadline = Instant::now() + self.timeout;
+    }
 
-            if let Some(frame) =
-                cut_frame(&mut self.pending_out, &mut self.pending_err, &self.fence)
-            {
-                return Ok(frame);
-            }
+    /// Whether the session can still be used: nothing has gone wrong on it,
+    /// and `ssh` has not exited in the meantime.
+    pub fn is_usable(&mut self) -> bool {
+        !self.broken && matches!(self.child.try_wait(), Ok(None))
+    }
 
-            if let Ok(Some(status)) = self.child.try_wait() {
-                // Drain whatever the pipes still hold before giving up: the
-                // reason the client stopped is usually in there.
-                thread::sleep(POLL_INTERVAL);
-                self.pending_err.extend_from_slice(&self.stderr.take());
-                let said = String::from_utf8_lossy(&self.pending_err)
-                    .trim()
-                    .to_string();
-                return Err(self.abandon(
-                    started,
-                    format!(
-                        "the sftp session ended ({status}){}",
-                        if said.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {said}")
-                        }
-                    ),
-                ));
+    /// The absolute form of `path`, as the server resolves it.
+    ///
+    /// # Errors
+    /// Fails when the server refuses or the connection fails.
+    pub fn realpath(&mut self, path: &str) -> Result<Vec<u8>, Failure> {
+        let id = self.id();
+        self.send(wire::realpath(id, path))?;
+        let mut entries = self.expect_name(id)?;
+        if entries.len() != 1 {
+            return Err(self.fail(
+                format!("the server resolved one path into {} names", entries.len()),
+                false,
+            ));
+        }
+        Ok(entries.remove(0).filename)
+    }
+
+    /// Metadata for `path` without following a link at its end, or `None`
+    /// when nothing is there.
+    ///
+    /// # Errors
+    /// Fails when the server refuses for any other reason, or the connection
+    /// fails.
+    pub fn lstat(&mut self, path: &str) -> Result<Option<Attrs>, Failure> {
+        let id = self.id();
+        self.send(wire::lstat(id, path))?;
+        absent_as_none(self.expect_attrs(id))
+    }
+
+    /// Creates a directory asking for `mode`, and reads back what is at
+    /// `path` afterwards, in one round trip.
+    ///
+    /// The two answers together settle what a single one cannot: whether
+    /// this call created the directory or found something already there, and
+    /// what its mode is either way.
+    ///
+    /// # Errors
+    /// Fails when the connection fails, or the read-back is refused for a
+    /// reason other than the path not existing.
+    pub fn mkdir_and_lstat(
+        &mut self,
+        path: &str,
+        mode: u32,
+    ) -> Result<(Result<(), Refusal>, Option<Attrs>), Failure> {
+        let made = self.id();
+        let looked = self.id();
+        self.send(wire::mkdir(made, path, mode))?;
+        self.send(wire::lstat(looked, path))?;
+        let created = match self.expect_ok(made) {
+            Ok(()) => Ok(()),
+            Err(Failure::Refused(refusal)) => Err(refusal),
+            Err(other) => return Err(other),
+        };
+        let attrs = absent_as_none(self.expect_attrs(looked))?;
+        Ok((created, attrs))
+    }
+
+    /// Sets the permissions of `path`.
+    ///
+    /// # Errors
+    /// Fails when the server refuses or the connection fails.
+    pub fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), Failure> {
+        let id = self.id();
+        self.send(wire::setstat_mode(id, path, mode))?;
+        self.expect_ok(id)
+    }
+
+    /// Every entry of a directory, `.` and `..` included, or `None` when the
+    /// directory does not exist.
+    ///
+    /// # Errors
+    /// Fails when the server refuses for another reason or the connection
+    /// fails.
+    pub fn list(&mut self, path: &str) -> Result<Option<Vec<NameEntry>>, Failure> {
+        let id = self.id();
+        self.send(wire::opendir(id, path))?;
+        let Some(handle) = absent_as_none(self.expect_handle(id))? else {
+            return Ok(None);
+        };
+
+        let mut all = Vec::new();
+        let listed = loop {
+            let id = self.id();
+            self.send(wire::readdir(id, &handle))?;
+            match self.expect_name(id) {
+                Ok(mut entries) => all.append(&mut entries),
+                Err(Failure::Refused(refusal)) if refusal.code == wire::status::EOF => {
+                    break Ok(());
+                }
+                Err(other) => break Err(other),
             }
-            if Instant::now() >= deadline {
-                return Err(self.abandon(
-                    started,
-                    format!(
-                        "the sftp session did not answer within {} seconds",
-                        timeout.as_secs()
-                    ),
-                ));
+        };
+        let closed = self.close(&handle);
+        listed?;
+        closed?;
+        Ok(Some(all))
+    }
+
+    /// Removes a file or a symbolic link, never following it.
+    ///
+    /// # Errors
+    /// Fails when the server refuses or the connection fails.
+    pub fn remove(&mut self, path: &str) -> Result<(), Failure> {
+        let id = self.id();
+        self.send(wire::remove(id, path))?;
+        self.expect_ok(id)
+    }
+
+    /// Removes an empty directory.
+    ///
+    /// # Errors
+    /// Fails when the server refuses or the connection fails.
+    pub fn rmdir(&mut self, path: &str) -> Result<(), Failure> {
+        let id = self.id();
+        self.send(wire::rmdir(id, path))?;
+        self.expect_ok(id)
+    }
+
+    /// Renames `from` to `to`, refusing to replace anything at `to`.
+    ///
+    /// # Errors
+    /// Fails when the server refuses or the connection fails.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), Failure> {
+        let id = self.id();
+        self.send(wire::rename(id, from, to))?;
+        self.expect_ok(id)
+    }
+
+    /// Writes `source` to a new file at `path` with `mode`, and returns the
+    /// metadata the server reports for it once every byte is acknowledged.
+    ///
+    /// The file is created exclusively, its mode is set on the open handle
+    /// before the first byte is written, and the handle is closed whether or
+    /// not the writes succeeded. The first refusal is the one reported.
+    ///
+    /// # Errors
+    /// Fails when the file cannot be created, a write is refused, the local
+    /// file cannot be read, or the connection fails.
+    pub fn upload(
+        &mut self,
+        source: &mut dyn Read,
+        path: &str,
+        mode: u32,
+    ) -> Result<Attrs, Failure> {
+        let id = self.id();
+        self.send(wire::open_exclusive(id, path, mode))?;
+        let handle = self.expect_handle(id)?;
+
+        match self.write_all(&handle, source, mode) {
+            Ok(()) => {
+                let looked = self.id();
+                let closed = self.id();
+                self.send(wire::fstat(looked, &handle))?;
+                self.send(wire::close(closed, &handle))?;
+                let attrs = self.expect_attrs(looked);
+                let close = self.expect_ok(closed);
+                let attrs = attrs?;
+                close?;
+                Ok(attrs)
             }
-            thread::sleep(POLL_INTERVAL);
+            Err(failure @ Failure::Broken { .. }) => Err(failure),
+            Err(failure) => {
+                // The refusal is what the caller needs. The handle is still
+                // released so the server can let go of the file, and whatever
+                // the close says is secondary to why it was needed.
+                let _ = self.close(&handle);
+                Err(failure)
+            }
         }
     }
 
-    /// Ends a session whose command could not be seen through, and decides
-    /// whether that command may have run.
-    ///
-    /// Having been written is not the test: a command written into the pipe
-    /// may still be waiting there while the client connects. Having been read
-    /// is. `sftp` echoes each command on stdout before it performs it, and its
-    /// stdout is line buffered, so a command that got as far as the server was
-    /// echoed first. With the client stopped and its stdout closed, an empty
-    /// stdout therefore means the command was never taken. Anything else
-    /// counts as sent, including a pipe that would not close: sending a
-    /// command twice is what this exists to prevent, and an error that a
-    /// second attempt might have avoided is the cheaper mistake.
-    fn abandon(&mut self, started: bool, message: String) -> SessionError {
-        self.stdin = None;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if started {
-            return SessionError::midway(message);
+    /// Sends the mode and every chunk of `source`, keeping at most
+    /// [`WRITE_WINDOW`] requests unanswered.
+    fn write_all(
+        &mut self,
+        handle: &[u8],
+        source: &mut dyn Read,
+        mode: u32,
+    ) -> Result<(), Failure> {
+        let mut pending = VecDeque::new();
+        let first = self.id();
+        self.send(wire::fsetstat_mode(first, handle, mode))?;
+        pending.push_back(first);
+
+        let mut buffer = vec![0_u8; wire::WRITE_CHUNK];
+        let mut offset = 0_u64;
+        let mut finished = false;
+        let mut failure = None;
+
+        loop {
+            while failure.is_none() && !finished && pending.len() < WRITE_WINDOW {
+                let read = match fill(source, &mut buffer) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        failure = Some(Failure::Local(error));
+                        break;
+                    }
+                };
+                if read > 0 {
+                    let id = self.id();
+                    self.send(wire::write(id, handle, offset, &buffer[..read]))?;
+                    pending.push_back(id);
+                    offset += read as u64;
+                }
+                finished = read < buffer.len();
+            }
+            let Some(id) = pending.pop_front() else {
+                break;
+            };
+            match self.expect_ok(id) {
+                Ok(()) => {}
+                Err(broken @ Failure::Broken { .. }) => return Err(broken),
+                // Stop sending, but collect the answers already owed: they are
+                // in the stream whether or not anyone wants them.
+                Err(refused) => {
+                    if failure.is_none() {
+                        failure = Some(refused);
+                    }
+                }
+            }
         }
-        let closed = self.stdout.wait_for_end(END_OF_OUTPUT_WAIT);
-        self.pending_out.extend_from_slice(&self.stdout.take());
-        if closed && self.pending_out.is_empty() {
-            SessionError::before_anything_ran(message)
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn close(&mut self, handle: &[u8]) -> Result<(), Failure> {
+        let id = self.id();
+        self.send(wire::close(id, handle))?;
+        self.expect_ok(id)
+    }
+
+    fn id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
+    }
+
+    fn send(&mut self, packet: Vec<u8>) -> Result<(), Failure> {
+        if self.broken {
+            return Err(self.fail("the SFTP session has already failed".to_string(), true));
+        }
+        let delivered = self
+            .requests
+            .as_ref()
+            .is_some_and(|requests| requests.send(packet).is_ok());
+        if delivered {
+            Ok(())
         } else {
-            SessionError::midway(message)
+            Err(self.fail(
+                "the connection closed while a request was being sent".to_string(),
+                true,
+            ))
+        }
+    }
+
+    fn next_packet(&mut self) -> Result<Vec<u8>, Failure> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        match self.replies.recv_timeout(left) {
+            Ok(Ok(body)) => Ok(body),
+            Ok(Err(reason)) => Err(self.fail(reason, true)),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(self.fail("the connection closed".to_string(), true))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                let reason = format!(
+                    "the server did not answer within {} seconds",
+                    self.timeout.as_secs()
+                );
+                let mut failure = self.fail(reason, true);
+                if let Failure::Broken { timed_out, .. } = &mut failure {
+                    *timed_out = true;
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    fn wait(&mut self, id: u32) -> Result<Reply, Failure> {
+        if let Some(reply) = self.early.remove(&id) {
+            return Ok(reply);
+        }
+        loop {
+            let body = self.next_packet()?;
+            let reply = wire::decode_reply(&body).map_err(|error| self.protocol(&error))?;
+            if reply.id() == id {
+                return Ok(reply);
+            }
+            self.early.insert(reply.id(), reply);
+        }
+    }
+
+    fn expect_ok(&mut self, id: u32) -> Result<(), Failure> {
+        match self.wait(id)? {
+            Reply::Status { code, .. } if code == wire::status::OK => Ok(()),
+            Reply::Status { code, message, .. } => Err(Failure::Refused(Refusal { code, message })),
+            other => Err(self.unexpected(&other)),
+        }
+    }
+
+    fn expect_handle(&mut self, id: u32) -> Result<Vec<u8>, Failure> {
+        match self.wait(id)? {
+            Reply::Handle { handle, .. } => Ok(handle),
+            other => Err(self.refusal_or_unexpected(other)),
+        }
+    }
+
+    fn expect_attrs(&mut self, id: u32) -> Result<Attrs, Failure> {
+        match self.wait(id)? {
+            Reply::Attrs { attrs, .. } => Ok(attrs),
+            other => Err(self.refusal_or_unexpected(other)),
+        }
+    }
+
+    fn expect_name(&mut self, id: u32) -> Result<Vec<NameEntry>, Failure> {
+        match self.wait(id)? {
+            Reply::Name { entries, .. } => Ok(entries),
+            other => Err(self.refusal_or_unexpected(other)),
+        }
+    }
+
+    fn refusal_or_unexpected(&mut self, reply: Reply) -> Failure {
+        match reply {
+            Reply::Status { code, message, .. } if code != wire::status::OK => {
+                Failure::Refused(Refusal { code, message })
+            }
+            other => self.unexpected(&other),
+        }
+    }
+
+    fn unexpected(&mut self, reply: &Reply) -> Failure {
+        self.fail(
+            format!(
+                "the server answered request {} with a reply of the wrong kind",
+                reply.id()
+            ),
+            false,
+        )
+    }
+
+    fn protocol(&mut self, error: &wire::WireError) -> Failure {
+        self.fail(error.to_string(), false)
+    }
+
+    /// Marks the session finished and gathers what `ssh` said about it.
+    ///
+    /// When the connection ended by itself, `ssh` is on its way out and the
+    /// reason is still arriving on stderr, so it is given a moment to finish.
+    /// Otherwise `ssh` is stopped at once: the session is over either way, and
+    /// waiting on a process that has nothing more to say would only delay the
+    /// error.
+    fn fail(&mut self, reason: String, ended: bool) -> Failure {
+        self.broken = true;
+        self.requests = None;
+        if !ended {
+            let _ = self.child.kill();
+        }
+        let deadline = Instant::now() + STDERR_GRACE;
+        while !self.stderr_reader.is_finished() && Instant::now() < deadline {
+            thread::sleep(POLL_INTERVAL);
+        }
+        if !self.stderr_reader.is_finished() {
+            let _ = self.child.kill();
+        }
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|held| String::from_utf8_lossy(&held).into_owned())
+            .unwrap_or_default();
+        Failure::Broken {
+            reason,
+            stderr,
+            timed_out: false,
         }
     }
 }
 
 impl Drop for SftpSession {
-    /// Closing stdin is how `sftp` is asked to exit; the kill is for a client
-    /// that ignores it. A session must not outlive the command that opened it:
-    /// The specification promises no process of Clift's is left running.
+    /// Closing stdin is how the server is told the session is over; the kill
+    /// is for an `ssh` that does not take the hint. A session must not outlive
+    /// the command that opened it.
     fn drop(&mut self) {
-        self.stdin = None;
+        self.requests = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// What one command printed.
-struct Frame {
-    stdout: String,
-    stderr: String,
-}
-
-/// What `sftp` says on stderr when it is handed a command it does not know.
-///
-/// This is produced entirely locally, by the client's own parser, which is why
-/// the fence costs no round trip and cannot be influenced by the remote host.
-const INVALID_COMMAND: &[u8] = b"Invalid command.";
-
-/// Takes one command's output off the front of both streams, once the fence
-/// has come back on each.
-///
-/// `None` while either half is incomplete, and then neither stream is touched:
-/// the pipes are drained separately, so one half routinely arrives first.
-/// Both markers are matched up to the end of their line rather than including
-/// a line ending, because the Windows build of OpenSSH's sftp ends its lines
-/// with `\r\n`.
-fn cut_frame(stdout: &mut Vec<u8>, stderr: &mut Vec<u8>, fence: &str) -> Option<Frame> {
-    let echo = format!("sftp> -{fence}");
-    if !has_line(stdout, echo.as_bytes()) || !has_line(stderr, INVALID_COMMAND) {
-        return None;
+/// `None` for "no such file", which is an answer here rather than a failure.
+fn absent_as_none<T>(result: Result<T, Failure>) -> Result<Option<T>, Failure> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(Failure::Refused(refusal)) if refusal.code == wire::status::NO_SUCH_FILE => Ok(None),
+        Err(other) => Err(other),
     }
-    let out = cut_line(stdout, echo.as_bytes())?;
-    let err = cut_line(stderr, INVALID_COMMAND)?;
-    Some(Frame {
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stderr: String::from_utf8_lossy(&err).into_owned(),
-    })
 }
 
-/// Whether `marker` and the end of the line it sits on have both arrived.
-fn has_line(buffer: &[u8], marker: &[u8]) -> bool {
-    find(buffer, marker).is_some_and(|at| buffer[at..].contains(&b'\n'))
-}
-
-/// As [`cut`], but consumes the whole line the marker sits on.
-///
-/// The marker is followed by a line ending whose bytes differ between
-/// platforms and versions, so the rule is "up to the next newline" rather than
-/// a fixed suffix. `None` until that newline has arrived, so that a marker
-/// split across two reads is not mistaken for a complete frame.
-fn cut_line(buffer: &mut Vec<u8>, marker: &[u8]) -> Option<Vec<u8>> {
-    let at = find(buffer, marker)?;
-    let newline = buffer[at..].iter().position(|byte| *byte == b'\n')? + at;
-    let rest = buffer.split_off(newline + 1);
-    let mut content = std::mem::replace(buffer, rest);
-    content.truncate(at);
-    Some(content)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+/// Reads until `buffer` is full or the source ends, so that only the last
+/// chunk of a file is ever short.
+fn fill(source: &mut dyn Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match source.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
-    (0..=haystack.len() - needle.len())
-        .find(|start| &haystack[*start..start + needle.len()] == needle)
+    Ok(filled)
 }
 
-/// A token no remote file name can be expected to contain.
-///
-/// A failure of the system random source is not fatal here and must not be:
-/// this value guards a text frame, not a key. It falls back to a constant, and
-/// the session then behaves exactly as it would have with a fixed marker --
-/// which is to say correctly, unless somebody on the remote host has planted a
-/// file name containing a newline and this exact string.
-fn fence_token() -> String {
-    let mut bytes = [0_u8; TOKEN_BYTES];
-    if getrandom::fill(&mut bytes).is_err() {
-        return "clift-fence".to_string();
-    }
-    let mut token = String::with_capacity(2 * TOKEN_BYTES + 12);
-    token.push_str("clift-fence-");
-    for byte in bytes {
-        token.push_str(&format!("{byte:02x}"));
-    }
-    token
+fn spawn_writer(mut stdin: std::process::ChildStdin) -> Sender<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        for packet in receiver {
+            if stdin
+                .write_all(&packet)
+                .and_then(|()| stdin.flush())
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    sender
 }
 
-/// A pipe drained on its own thread, so a child that fills its output buffer
-/// while Clift is writing to its input cannot deadlock against it.
-#[derive(Debug)]
-struct Stream {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    reader: thread::JoinHandle<()>,
-}
-
-impl Stream {
-    fn draining<R: Read + Send + 'static>(mut source: R) -> Self {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&buffer);
-        let reader = thread::spawn(move || {
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match source.read(&mut chunk) {
-                    Ok(0) | Err(_) => return,
-                    Ok(read) => match sink.lock() {
-                        Ok(mut held) => held.extend_from_slice(&chunk[..read]),
-                        Err(_) => return,
-                    },
+fn spawn_reader(mut stdout: std::process::ChildStdout) -> Receiver<Result<Vec<u8>, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let mut header = [0_u8; 4];
+            if stdout.read_exact(&mut header).is_err() {
+                let _ = sender.send(Err("the connection closed".to_string()));
+                return;
+            }
+            let length = match wire::packet_length(header) {
+                Ok(length) => length,
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    return;
                 }
+            };
+            let mut body = vec![0_u8; length];
+            if stdout.read_exact(&mut body).is_err() {
+                let _ = sender.send(Err(
+                    "the connection closed in the middle of a reply".to_string()
+                ));
+                return;
             }
-        });
-        Self { buffer, reader }
-    }
-
-    /// Waits up to `limit` for the pipe to close, and says whether it did.
-    fn wait_for_end(&self, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        while !self.reader.is_finished() {
-            if Instant::now() >= deadline {
-                return false;
+            if sender.send(Ok(body)).is_err() {
+                return;
             }
-            thread::sleep(POLL_INTERVAL);
         }
-        true
-    }
-
-    /// Everything read since the last call.
-    fn take(&self) -> Vec<u8> {
-        match self.buffer.lock() {
-            Ok(mut held) => std::mem::take(&mut *held),
-            // A panicked reader thread cannot corrupt a byte buffer, and
-            // treating it as "nothing new" lets the caller's timeout report the
-            // situation rather than this returning a second panic.
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        }
-    }
+    });
+    receiver
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_frame_ends_at_the_marker_and_leaves_the_rest() {
-        let mut stdout =
-            b"sftp> pwd\nRemote working directory: /home/dev\nsftp> -tok\nnext".to_vec();
-        let mut stderr = b"Invalid command.\nlater".to_vec();
-        let frame = cut_frame(&mut stdout, &mut stderr, "tok").unwrap();
-        assert_eq!(
-            frame.stdout,
-            "sftp> pwd\nRemote working directory: /home/dev\n"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&stdout),
-            "next",
-            "what arrived after the fence belongs to the next command"
-        );
-        assert_eq!(String::from_utf8_lossy(&stderr), "later");
-    }
-
-    #[test]
-    fn a_marker_that_has_not_arrived_yet_is_not_a_frame() {
-        let mut stdout = b"sftp> pwd\nsftp> -to".to_vec();
-        let mut stderr = b"Invalid command.\n".to_vec();
-        assert!(
-            cut_frame(&mut stdout, &mut stderr, "tok").is_none(),
-            "half a marker must not end a frame"
-        );
-        assert_eq!(
-            (stdout.len(), stderr.len()),
-            (19, 17),
-            "and both buffers must be left intact for the next read"
-        );
-    }
-
-    /// The error half is only complete once its line ending has arrived, which
-    /// is what stops a marker split across two reads from ending a frame early.
-    #[test]
-    fn the_error_half_of_a_frame_consumes_the_whole_marker_line() {
-        let mut buffer = b"Can't ls: \"/x\" not found\r\nInvalid command.".to_vec();
-        assert_eq!(cut_line(&mut buffer, INVALID_COMMAND), None);
-
-        buffer.extend_from_slice(b"\r\nCan't ls: \"/y\" not found\r\n");
-        let content = cut_line(&mut buffer, INVALID_COMMAND).unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&content),
-            "Can't ls: \"/x\" not found\r\n",
-            "only what the command itself said"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&buffer),
-            "Can't ls: \"/y\" not found\r\n"
-        );
-    }
-
-    /// The Windows build of OpenSSH's sftp ends every line with `\r\n`, the
-    /// echoed fence included.
-    #[test]
-    fn a_frame_ends_at_the_fence_whatever_the_line_ending() {
-        for newline in ["\n", "\r\n"] {
-            let mut stdout = format!(
-                "sftp> -pwd{newline}Remote working directory: /root{newline}sftp> -tok{newline}next"
-            )
-            .into_bytes();
-            let mut stderr = format!("Invalid command.{newline}").into_bytes();
-            let frame = cut_frame(&mut stdout, &mut stderr, "tok")
-                .unwrap_or_else(|| panic!("no frame with {newline:?} line endings"));
-            assert!(frame.stdout.contains("Remote working directory: /root"));
-            assert_eq!(frame.stderr, "");
-            assert_eq!(
-                String::from_utf8_lossy(&stdout),
-                "next",
-                "what follows the fence belongs to the next command"
-            );
-            assert!(stderr.is_empty());
+fn spawn_stderr(
+    mut stderr: std::process::ChildStderr,
+    sink: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => match sink.lock() {
+                    Ok(mut held) => held.extend_from_slice(&chunk[..read]),
+                    Err(_) => return,
+                },
+            }
         }
-    }
-
-    /// The two pipes are drained separately, so the fence can come back on
-    /// one before the other. What has already arrived must survive the wait.
-    #[test]
-    fn a_frame_waits_for_both_halves_without_losing_either() {
-        let mut stdout = b"Remote working directory: /root\nsftp> -tok\n".to_vec();
-        let mut stderr = Vec::new();
-        assert!(cut_frame(&mut stdout, &mut stderr, "tok").is_none());
-
-        stderr.extend_from_slice(b"Invalid command.\n");
-        let frame = cut_frame(&mut stdout, &mut stderr, "tok")
-            .unwrap_or_else(|| panic!("both halves have arrived"));
-        assert_eq!(frame.stdout, "Remote working directory: /root\n");
-    }
-
-    #[cfg(unix)]
-    fn a_rename() -> SftpBatch {
-        let mut batch = SftpBatch::new();
-        batch
-            .push("rename", &["/inbox/.a.part", "/inbox/a.png"])
-            .unwrap();
-        batch
-    }
-
-    /// `sftp` echoes a command before it runs it, so a client that echoed the
-    /// command may already have sent it to the server. `cat` stands in for
-    /// that client: it takes the command and echoes it, but never produces
-    /// the fence's `Invalid command.`, so the command runs into the timeout.
-    /// Starting over from there would send the rename a second time.
-    #[cfg(unix)]
-    #[test]
-    fn a_command_the_client_took_counts_as_sent_even_when_it_never_answers() {
-        let mut session = SftpSession::open(Path::new("cat"), &[], false).unwrap();
-        let error = session
-            .run(&a_rename(), Duration::from_millis(300))
-            .unwrap_err();
-        assert!(
-            error.started,
-            "a command the client had already taken was reported as never sent: {error:?}"
-        );
-    }
-
-    /// The other side of the same line: a client that exits without having
-    /// read its input, the way `sftp` does when authentication fails, has run
-    /// nothing, and the caller may still start over.
-    #[cfg(unix)]
-    #[test]
-    fn a_command_the_client_never_took_may_be_sent_again() {
-        let mut session =
-            SftpSession::open(Path::new("sleep"), &[OsString::from("30")], false).unwrap();
-        let error = session
-            .run(&a_rename(), Duration::from_millis(300))
-            .unwrap_err();
-        assert!(
-            !error.started,
-            "a command nothing had read was reported as sent: {error:?}"
-        );
-    }
-
-    /// The token guards against a remote file name forging a frame marker, so
-    /// two sessions must not share one.
-    #[test]
-    fn every_session_gets_its_own_token() {
-        let first = fence_token();
-        let second = fence_token();
-        assert_ne!(first, second);
-        assert!(first.starts_with("clift-fence-"));
-        assert_eq!(first.len(), "clift-fence-".len() + 2 * TOKEN_BYTES);
-    }
+    })
 }

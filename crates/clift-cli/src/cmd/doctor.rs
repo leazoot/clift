@@ -1,6 +1,6 @@
 //! `clift doctor [target]`.
 //!
-//! Renders the thirteen checks. The command's exit status is what a script
+//! Renders the twelve checks. The command's exit status is what a script
 //! reads, so it follows the report: any failure is exit code 30, warnings are
 //! not failures. An installation with nothing configured for Fast Mode is
 //! incomplete, not broken, and telling a user otherwise trains them to ignore
@@ -80,7 +80,7 @@ pub fn run(target: Option<&str>, reporter: &Reporter) -> Result<(), CliftError> 
             }),
         reporter,
     );
-    // Thirteen checks, several of them a round trip each. Without this, doctor
+    // Twelve checks, several of them a round trip each. Without this, doctor
     // looks hung for half a minute on a distant host.
     let spinner = Spinner::new(reporter.interactive());
     let narrating = Narrating::new(&transport, &spinner);

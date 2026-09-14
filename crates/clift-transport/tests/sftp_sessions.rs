@@ -1,85 +1,39 @@
-//! One `sftp` session for the whole run, against a real SSH server.
+//! One SFTP session for the whole run, against a real SSH server.
 //!
-//! Connection reuse made four operations cost one authentication. It
-//! did not change how many times the *server* is asked to start an
-//! `sftp-server`, and that turned out to be where the time had gone: eleven
-//! subsystem starts for one `clift send`.
+//! Connection reuse made four operations cost one authentication where the
+//! client supports it. It did not change how many times the *server* is asked
+//! to start an `sftp-server`, and on a client without connection reuse --
+//! Windows among them -- every operation was a new connection as well.
 //!
-//! So that is the number counted here, and it is counted in sshd's own log --
-//! `Starting session: subsystem 'sftp' ...`, one line per start. How many
-//! processes Clift began is Clift's own word for it; how many subsystems the
-//! server started is not.
-//!
-//! The second test in this file is the one the design rests on. Running a
-//! batch inside a live session means Clift, not `sftp`, decides when a batch
-//! has failed, and it decides by looking at whether the command wrote to
-//! stderr. That is only sound if a successful command writes nothing there, so
-//! every verb Clift actually uses is run successfully against a real server and
-//! checked.
+//! Both numbers are counted here in sshd's own log: `Starting session:
+//! subsystem 'sftp' ...` once per subsystem start, `Accepted publickey` once
+//! per authentication. How many processes Clift began is Clift's own word for
+//! it; what the server saw is not.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "../../../tests/e2e/fixtures.rs"]
 mod fixtures;
 
-use clift_core::domain::RemotePath;
+use clift_core::domain::{RemotePath, SafeFileName};
 use clift_core::ports::TransportTarget;
 use clift_transport::probe::OpenSshTransport;
-use clift_transport::proc::{SftpBatch, SshRunner};
+use clift_transport::proc::SshRunner;
 use fixtures::{SshdFixture, Topology, skip_without_docker};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// A command still running on the server when the timeout arrives is reported,
-/// never sent again. `sftp` had already taken it, so it may have done its work
-/// there; for a `rename` a second attempt is a second rename.
-///
-/// The command is a `put` into a FIFO. The server's `open` blocks until
-/// something reads the other end, and nothing does, so the command is stuck on
-/// the server itself rather than slow on the way. Every attempt to send it
-/// again, in a new session or in a one-shot `sftp`, starts another subsystem
-/// and shows up in sshd's log.
-#[test]
-fn a_command_that_outlasts_the_timeout_is_not_sent_again() {
-    if skip_without_docker("a_command_that_outlasts_the_timeout_is_not_sent_again") {
-        return;
-    }
-    let fixture = SshdFixture::start(Topology::Normal);
-    let target = TransportTarget::new(fixture.alias());
-    let fifo = format!("{}/stuck", fixture.remote_home());
-    let made = fixture.ssh(&format!("mkfifo {fifo}"));
-    assert!(made.status.success(), "mkfifo failed: {made:?}");
-    let payload = fixture.workdir().join("payload.bin");
-    std::fs::write(&payload, b"one attachment").unwrap();
-
-    let timeout = Duration::from_secs(2);
-    let runner = SshRunner::new()
-        .with_config_file(fixture.ssh_config())
-        .with_sessions()
-        .with_timeout(timeout);
-    let mut batch = SftpBatch::new();
-    batch
-        .push("put", &[payload.to_str().unwrap(), fifo.as_str()])
-        .unwrap();
-
-    let before = sftp_sessions(&fixture);
-    let started = Instant::now();
-    let error = runner
-        .run_sftp(&target, &batch)
-        .expect_err("a put that never finishes cannot succeed");
-    let elapsed = started.elapsed();
-    let after = sftp_sessions(&fixture);
-
-    assert_eq!(
-        after - before,
-        1,
-        "the stuck put was sent again after {elapsed:?}: {error}"
-    );
-    assert!(
-        elapsed < timeout * 2,
-        "one timeout is the whole wait, not one per attempt: {elapsed:?}"
-    );
-    assert_eq!(error.exit_code().as_u8(), 23, "{error}");
+fn server_log(fixture: &SshdFixture) -> String {
+    let output = Command::new("docker")
+        .arg("logs")
+        .arg(fixture.container())
+        .output()
+        .expect("docker logs must be runnable");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 /// How many times the server was asked to start an sftp subsystem.
@@ -87,19 +41,39 @@ fn a_command_that_outlasts_the_timeout_is_not_sent_again() {
 /// Requires `LogLevel VERBOSE` in the fixture's sshd configuration, which is
 /// what makes this line appear at all.
 fn sftp_sessions(fixture: &SshdFixture) -> usize {
-    let output = Command::new("docker")
-        .arg("logs")
-        .arg(fixture.container())
-        .output()
-        .expect("docker logs must be runnable");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    text.lines()
+    server_log(fixture)
+        .lines()
         .filter(|line| line.contains("subsystem 'sftp'"))
         .count()
+}
+
+/// How many times the server accepted a key. "Accepted publickey", not
+/// "Accepted": at `LogLevel VERBOSE` sshd also logs "Accepted key ... found
+/// at ..." while it is still deciding.
+fn authentications(fixture: &SshdFixture) -> usize {
+    server_log(fixture)
+        .lines()
+        .filter(|line| line.contains("Accepted publickey"))
+        .count()
+}
+
+/// Sends a signal to every `sftp-server` in the container.
+///
+/// This is how a server that stops answering is produced for real: the
+/// process that serves the session is paused, so the request is genuinely
+/// unanswered rather than simulated. The image has no `pkill`, so the processes
+/// are found through `/proc`.
+fn signal_sftp_servers(fixture: &SshdFixture, signal: &str) {
+    let script = format!(
+        "for p in /proc/[0-9]*; do \
+         [ \"$(cat $p/comm 2>/dev/null)\" = sftp-server ] && kill -{signal} \"${{p#/proc/}}\"; \
+         done; true"
+    );
+    let status = Command::new("docker")
+        .args(["exec", fixture.container(), "sh", "-c", &script])
+        .status()
+        .expect("docker exec must be runnable");
+    assert!(status.success(), "could not send {signal} to sftp-server");
 }
 
 fn home(fixture: &SshdFixture, suffix: &str) -> RemotePath {
@@ -150,12 +124,10 @@ fn a_run_costs_one_sftp_session_however_many_operations_it_makes() {
 
 /// The control: the same six operations without sessions.
 ///
-/// It is what makes the number above mean something. It also shows why the
-/// count is not six: several of these operations are more than one batch --
-/// `ensure_dir` alone stats, creates and stats again.
+/// It is what makes the number above mean something.
 #[test]
-fn without_sessions_every_batch_starts_its_own_subsystem() {
-    if skip_without_docker("without_sessions_every_batch_starts_its_own_subsystem") {
+fn without_sessions_every_operation_starts_its_own_subsystem() {
+    if skip_without_docker("without_sessions_every_operation_starts_its_own_subsystem") {
         return;
     }
     let fixture = SshdFixture::start(Topology::Normal);
@@ -173,147 +145,164 @@ fn without_sessions_every_batch_starts_its_own_subsystem() {
     );
 }
 
-/// The assumption the session design rests on, checked against a real server.
+/// Everything the remote side of a send does, on a client that cannot reuse
+/// connections, costs one authentication.
 ///
-/// Inside a session there is no per-command exit status to read, so "did this
-/// command fail" is answered by "did it write to stderr". Every verb Clift
-/// sends is run here in a way that must succeed; any one of them printing a
-/// warning would make Clift call a successful operation a failure.
+/// No `ControlMaster` is configured here, which is exactly the position of a
+/// Windows client: the only thing standing between one send and a dozen
+/// logins is the session itself.
 #[test]
-fn no_verb_clift_uses_writes_to_stderr_when_it_succeeds() {
-    if skip_without_docker("no_verb_clift_uses_writes_to_stderr_when_it_succeeds") {
+fn a_send_costs_one_authentication_without_connection_reuse() {
+    if skip_without_docker("a_send_costs_one_authentication_without_connection_reuse") {
         return;
     }
     let fixture = SshdFixture::start(Topology::Normal);
     let target = TransportTarget::new(fixture.alias());
-    let runner = SshRunner::new()
-        .with_config_file(fixture.ssh_config())
-        .with_sessions();
+    let local = fixture.workdir().join("shot.png");
+    std::fs::write(&local, vec![9_u8; 200_000]).unwrap();
 
-    let local = fixture.workdir().join("payload.bin");
-    // Large enough that `put` would have something to report a progress meter
-    // about, if it were going to.
-    std::fs::write(&local, vec![7_u8; 1024 * 1024]).unwrap();
-    let directory = format!("{}/verbs", fixture.remote_home());
+    let logins_before = authentications(&fixture);
+    let sessions_before = sftp_sessions(&fixture);
 
-    let each: [(&'static str, Vec<String>); 9] = [
-        ("pwd", vec![]),
-        ("mkdir", vec![directory.clone()]),
-        ("chmod", vec!["700".to_string(), directory.clone()]),
-        (
-            "put",
-            vec![
-                local.to_string_lossy().into_owned(),
-                format!("{directory}/a"),
-            ],
-        ),
-        ("chmod", vec!["600".to_string(), format!("{directory}/a")]),
-        ("ls", vec!["-la".to_string(), directory.clone()]),
-        (
-            "rename",
-            vec![format!("{directory}/a"), format!("{directory}/b")],
-        ),
-        ("rm", vec![format!("{directory}/b")]),
-        ("rmdir", vec![directory.clone()]),
-    ];
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions(),
+    );
+    let root = home(&fixture, ".cache/clift/inbox");
+    let batch = home(&fixture, ".cache/clift/inbox/2026-09-14/0123456789abcdef");
+    let destination = batch.join(&SafeFileName::new("shot.png").unwrap());
 
-    for (verb, operands) in each {
-        let mut batch = SftpBatch::new();
-        let borrowed: Vec<&str> = operands.iter().map(String::as_str).collect();
-        batch.push(verb, &borrowed).unwrap();
-        let outcome = runner.run_sftp(&target, &batch).unwrap();
-        assert_eq!(
-            outcome.stderr, "",
-            "`{verb}` succeeded but wrote to stderr, which is how a session \
-             decides a command failed"
-        );
-        assert!(outcome.succeeded(), "`{verb}` was reported as failed");
-    }
+    transport.resolve_home(&target).unwrap();
+    transport.ensure_dir(&target, &root, 0o700).unwrap();
+    transport.ensure_dir(&target, &batch, 0o700).unwrap();
+    let sent = transport
+        .upload_atomic(&target, &local, &destination)
+        .unwrap();
+    drop(transport);
+
+    assert_eq!(sent, 200_000);
+    assert_eq!(
+        authentications(&fixture) - logins_before,
+        1,
+        "one send authenticated more than once"
+    );
+    assert_eq!(sftp_sessions(&fixture) - sessions_before, 1);
 }
 
-/// A batch stops at its first failure, exactly as a one-shot batch script does.
+/// A request the server never answers is reported, never sent again.
 ///
-/// This is not a nicety. `ensure_dir` sends `mkdir` and `chmod` together, and a
-/// `chmod` that ran after its `mkdir` had failed would be Clift changing the
-/// permissions of a directory that was already there -- the one thing
-/// `ensure_dir` documents that it will never do.
+/// The server's `sftp-server` is paused after the session is open, so the
+/// request is stuck on the server itself. Starting over would mean a new
+/// session, which would show up in sshd's log; for a `rename`, a second
+/// attempt is a second rename.
 #[test]
-fn a_batch_stops_at_its_first_failure() {
-    if skip_without_docker("a_batch_stops_at_its_first_failure") {
+fn a_request_the_server_never_answers_is_reported_and_not_sent_again() {
+    if skip_without_docker("a_request_the_server_never_answers_is_reported_and_not_sent_again") {
         return;
     }
     let fixture = SshdFixture::start(Topology::Normal);
     let target = TransportTarget::new(fixture.alias());
-    let runner = SshRunner::new()
-        .with_config_file(fixture.ssh_config())
-        .with_sessions();
-
-    let after_the_failure = format!("{}/must-not-exist", fixture.remote_home());
-    let mut batch = SftpBatch::new();
-    batch
-        .push("mkdir", &["/proc/no-such-parent/child"])
-        .unwrap();
-    batch.push("mkdir", &[after_the_failure.as_str()]).unwrap();
-
-    let outcome = runner.run_sftp(&target, &batch).unwrap();
-    assert!(!outcome.succeeded(), "the first command cannot have worked");
-    assert!(
-        !outcome.stderr.is_empty(),
-        "a failure must carry the server's own words"
+    let timeout = Duration::from_secs(2);
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions()
+            .with_timeout(timeout),
     );
+    transport.resolve_home(&target).unwrap();
 
-    let mut look = SftpBatch::new();
-    look.push("ls", &["-la", after_the_failure.as_str()])
-        .unwrap();
-    let found = runner.run_sftp(&target, &look).unwrap();
+    let before = sftp_sessions(&fixture);
+    signal_sftp_servers(&fixture, "STOP");
+    let started = Instant::now();
+    let outcome = transport.remove(&target, &home(&fixture, "anything"));
+    let elapsed = started.elapsed();
+    signal_sftp_servers(&fixture, "CONT");
+    let after = sftp_sessions(&fixture);
+
+    let error = outcome.expect_err("an unanswered request cannot succeed");
+    assert_eq!(
+        after - before,
+        0,
+        "the unanswered request was sent again in a new session after {elapsed:?}: {error}"
+    );
     assert!(
-        !found.succeeded(),
-        "the second command ran even though the first had failed"
+        elapsed < timeout * 2,
+        "one timeout is the whole wait, not one per attempt: {elapsed:?}"
+    );
+    assert_eq!(
+        error.exit_code().as_u8(),
+        22,
+        "a stopped connection is a connection failure: {error}"
     );
 }
 
-/// A session and a one-shot batch answer the same question the same way.
-///
-/// The session path parses text out of a stream instead of out of a finished
-/// process, and this is what says the two agree.
+/// A kept session that has ended since its last use is replaced before
+/// anything is sent on it, so a server that closed an idle session between two
+/// operations costs a reconnection, not a failed send.
 #[test]
-fn a_session_returns_what_a_one_shot_batch_would_have() {
-    if skip_without_docker("a_session_returns_what_a_one_shot_batch_would_have") {
+fn a_session_that_has_ended_is_replaced_before_anything_is_sent_on_it() {
+    if skip_without_docker("a_session_that_has_ended_is_replaced_before_anything_is_sent_on_it") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions(),
+    );
+    transport.resolve_home(&target).unwrap();
+
+    let before = sftp_sessions(&fixture);
+    signal_sftp_servers(&fixture, "TERM");
+    // Long enough for `ssh` to see its channel close and exit.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let found = transport
+        .stat(&target, &home(&fixture, "not-there"))
+        .expect("the next operation must get a working session");
+    assert_eq!(found, None);
+    assert_eq!(sftp_sessions(&fixture) - before, 1);
+}
+
+/// A kept session and a fresh one answer the same question the same way.
+#[test]
+fn a_kept_session_returns_what_a_fresh_one_would_have() {
+    if skip_without_docker("a_kept_session_returns_what_a_fresh_one_would_have") {
         return;
     }
     let fixture = SshdFixture::start(Topology::Normal);
     let target = TransportTarget::new(fixture.alias());
 
-    let one_shot =
+    let fresh =
         OpenSshTransport::with_runner(SshRunner::new().with_config_file(fixture.ssh_config()));
-    let session = OpenSshTransport::with_runner(
+    let kept = OpenSshTransport::with_runner(
         SshRunner::new()
             .with_config_file(fixture.ssh_config())
             .with_sessions(),
     );
 
     assert_eq!(
-        one_shot.resolve_home(&target).unwrap().as_str(),
-        session.resolve_home(&target).unwrap().as_str()
+        fresh.resolve_home(&target).unwrap().as_str(),
+        kept.resolve_home(&target).unwrap().as_str()
     );
 
     let directory = home(&fixture, "compare");
-    one_shot.ensure_dir(&target, &directory, 0o700).unwrap();
-
-    let from_one_shot = one_shot.stat(&target, &directory).unwrap();
-    let from_session = session.stat(&target, &directory).unwrap();
+    fresh.ensure_dir(&target, &directory, 0o700).unwrap();
     assert_eq!(
-        from_one_shot, from_session,
+        fresh.stat(&target, &directory).unwrap(),
+        kept.stat(&target, &directory).unwrap(),
         "the same directory, read twice"
     );
 
     let missing = home(&fixture, "compare-absent");
-    assert_eq!(one_shot.stat(&target, &missing).unwrap(), None);
+    assert_eq!(fresh.stat(&target, &missing).unwrap(), None);
     assert_eq!(
-        session.stat(&target, &missing).unwrap(),
+        kept.stat(&target, &missing).unwrap(),
         None,
-        "a missing path must be an answer in a session too, not an error"
+        "a missing path must be an answer in a kept session too, not an error"
     );
 
-    one_shot.remove(&target, &directory).unwrap();
+    fresh.remove(&target, &directory).unwrap();
 }

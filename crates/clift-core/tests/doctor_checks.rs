@@ -64,7 +64,6 @@ fn healthy_transport() -> RecordingTransport {
     let transport = RecordingTransport::new("/home/dev");
     for name in [
         "ssh client",
-        "sftp client",
         "connection",
         "host key",
         "authentication",
@@ -76,7 +75,7 @@ fn healthy_transport() -> RecordingTransport {
 }
 
 #[test]
-fn all_thirteen_checks_are_reported_in_order_every_time() {
+fn all_twelve_checks_are_reported_in_order_every_time() {
     let transport = healthy_transport();
     let ssh_config = FakeSshConfig::resolving("dev", "192.0.2.10", 2222);
     let environment = Environment {
@@ -103,60 +102,12 @@ fn all_thirteen_checks_are_reported_in_order_every_time() {
     }
 }
 
-/// Through a client that hides group and other permissions, the inbox check
-/// warns rather than passes, and names a command that shows the rest.
-#[test]
-fn an_inbox_seen_without_group_and_other_permissions_is_a_warning() {
-    let transport = healthy_transport();
-    transport.hide_mode_bits(0o077);
-    let ssh_config = FakeSshConfig::resolving("dev", "192.0.2.10", 2222);
-    let environment = Environment {
-        facts: facts(),
-        ssh_config: &ssh_config,
-        remote: &transport,
-        upload: &transport,
-        clipboard: None,
-        remote_dir: None,
-        injection: None,
-        relay: None,
-        config: healthy_config(),
-    };
-
-    let report = diagnose(&environment, Some(&target()));
-    assert_eq!(
-        status_of(&report, CheckName::InboxPermissions),
-        CheckStatus::Warn
-    );
-    let detail = detail_of(&report, CheckName::InboxPermissions);
-    assert!(detail.contains("group and other"), "{detail}");
-    let check = report
-        .checks
-        .iter()
-        .find(|check| check.name == CheckName::InboxPermissions)
-        .unwrap();
-    assert!(
-        format!("{check:?}").contains("ls -ld"),
-        "the warning must come with a way to see the rest: {check:?}"
-    );
-    assert_eq!(
-        status_of(&report, CheckName::UploadAndCleanup),
-        CheckStatus::Pass,
-        "the owner's bits were right, so the send checks still run"
-    );
-}
-
 /// A check that fails must not stop the ones after it.
 #[test]
 fn one_failure_does_not_stop_the_remaining_checks() {
     let transport = RecordingTransport::new("/home/dev");
     transport.report_check("ssh client", CheckStatus::Fail, "ssh is not installed");
-    for name in [
-        "sftp client",
-        "connection",
-        "host key",
-        "authentication",
-        "sftp subsystem",
-    ] {
+    for name in ["connection", "host key", "authentication", "sftp subsystem"] {
         transport.report_check(name, CheckStatus::Pass, "fine");
     }
     let ssh_config = FakeSshConfig::resolving("dev", "192.0.2.10", 2222);
@@ -173,7 +124,7 @@ fn one_failure_does_not_stop_the_remaining_checks() {
     };
 
     let report = diagnose(&environment, Some(&target()));
-    assert_eq!(report.checks.len(), 13);
+    assert_eq!(report.checks.len(), 12);
     assert_eq!(status_of(&report, CheckName::SshClient), CheckStatus::Fail);
     assert_eq!(
         status_of(&report, CheckName::UploadAndCleanup),
@@ -189,7 +140,6 @@ fn one_failure_does_not_stop_the_remaining_checks() {
 fn every_failure_carries_one_runnable_command() {
     let transport = RecordingTransport::new("/home/dev");
     transport.report_check("ssh client", CheckStatus::Fail, "missing");
-    transport.report_check("sftp client", CheckStatus::Fail, "missing");
     transport.report_check("connection", CheckStatus::Fail, "refused");
     transport.report_check("sftp subsystem", CheckStatus::Fail, "missing");
     transport.fail_ensure_dir("home is not writable");
@@ -256,10 +206,9 @@ fn each_check_that_can_fail_has_its_failure_exercised() {
     let report = diagnose(&environment, Some(&target()));
     assert_eq!(status_of(&report, CheckName::Clipboard), CheckStatus::Fail);
 
-    // ssh client, sftp client, authentication, sftp subsystem
+    // ssh client, authentication, sftp subsystem
     for (probe_name, check) in [
         ("ssh client", CheckName::SshClient),
-        ("sftp client", CheckName::SftpClient),
         ("connection", CheckName::Authentication),
         ("host key", CheckName::Authentication),
         ("authentication", CheckName::Authentication),
@@ -452,7 +401,6 @@ fn with_a_relay_configured_the_host_checks_call_fast_mode_optional() {
 
     for name in [
         CheckName::SshClient,
-        CheckName::SftpClient,
         CheckName::HostResolution,
         CheckName::Authentication,
         CheckName::SftpSubsystem,

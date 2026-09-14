@@ -92,8 +92,6 @@ pub struct RecordingTransport {
     probe_checks: Mutex<Vec<ProbeCheck>>,
     fail_ensure_dir: Mutex<Option<String>>,
     fail_list_dir: Mutex<Option<String>>,
-    directories: Mutex<BTreeMap<String, u32>>,
-    hidden_mode_bits: Mutex<u32>,
 }
 
 impl RecordingTransport {
@@ -112,8 +110,6 @@ impl RecordingTransport {
             probe_checks: Mutex::new(Vec::new()),
             fail_ensure_dir: Mutex::new(None),
             fail_list_dir: Mutex::new(None),
-            directories: Mutex::new(BTreeMap::new()),
-            hidden_mode_bits: Mutex::new(0),
         }
     }
 
@@ -126,14 +122,6 @@ impl RecordingTransport {
             .unwrap_or_else(|error| panic!("invalid fake cache home {path:?}: {error}"));
         if let Ok(mut slot) = self.cache_home.lock() {
             *slot = Some(parsed);
-        }
-    }
-
-    /// Makes every listing hide `mask` of the permission bits, the way the
-    /// Windows build of OpenSSH's sftp hides group and other.
-    pub fn hide_mode_bits(&self, mask: u32) {
-        if let Ok(mut slot) = self.hidden_mode_bits.lock() {
-            *slot = mask;
         }
     }
 
@@ -244,9 +232,6 @@ impl RemoteFs for RecordingTransport {
                 reason,
             ));
         }
-        if let Ok(mut directories) = self.directories.lock() {
-            directories.insert(path.as_str().to_string(), mode);
-        }
         Ok(())
     }
 
@@ -258,32 +243,19 @@ impl RemoteFs for RecordingTransport {
         self.record(TransportCall::Stat {
             path: path.as_str().to_string(),
         });
-        // Uploads and ensured directories are remembered so that "make it,
-        // look at it, remove it, look again" behaves the way it does against a
-        // real host. Anything else is absent, which is what a fresh host looks
-        // like.
-        let hidden = self.hidden_mode_bits.lock().map_or(0, |mask| *mask);
-        let file = self
+        // Uploads are remembered so that "upload it, look at it, remove it,
+        // look again" behaves the way it does against a real host. Anything
+        // never uploaded is absent, which is what a fresh host looks like.
+        Ok(self
             .uploaded
             .lock()
             .ok()
             .and_then(|files| files.get(path.as_str()).copied())
-            .map(|size| (RemoteEntryKind::File, size, 0o600));
-        let directory = || {
-            self.directories
-                .lock()
-                .ok()
-                .and_then(|directories| directories.get(path.as_str()).copied())
-                .map(|mode| (RemoteEntryKind::Directory, 4096, mode))
-        };
-        Ok(file
-            .or_else(directory)
-            .map(|(kind, size, mode)| RemoteEntry {
+            .map(|size| RemoteEntry {
                 name: base_name(path),
-                kind,
+                kind: RemoteEntryKind::File,
                 size,
-                mode: Some(mode & !hidden),
-                hidden_mode_bits: hidden,
+                mode: Some(0o600),
                 modified: None,
             }))
     }

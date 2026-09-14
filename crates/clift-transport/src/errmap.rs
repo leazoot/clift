@@ -194,6 +194,41 @@ pub fn map_failure(
     .with_source(OpenSshOutput::new(stderr))
 }
 
+/// Builds the error for a request the SFTP server refused.
+///
+/// Version 3 has few status codes, and they map onto the same symptoms as the
+/// text the `sftp` program used to print for them: "no such file", "permission
+/// denied", and a bare "failure" that covers both a full disk and a directory
+/// that is already there. The server's own message is kept as the cause.
+#[must_use]
+pub fn map_refusal(
+    target: &TransportTarget,
+    stage: Stage,
+    action: &str,
+    code: u32,
+    message: &str,
+) -> CliftError {
+    let symptom = match code {
+        crate::wire::status::NO_SUCH_FILE => Symptom::RemoteMissing,
+        crate::wire::status::PERMISSION_DENIED => Symptom::RemotePermissionDenied,
+        crate::wire::status::FAILURE => Symptom::TransferFailed,
+        _ => Symptom::Unrecognised,
+    };
+    let said = if message.trim().is_empty() {
+        format!("SFTP status {code}")
+    } else {
+        message.trim().to_string()
+    };
+    let host = target.ssh_host();
+    CliftError::new(
+        stage,
+        symptom.kind(stage),
+        format!("{action} on {host}: {said}"),
+    )
+    .with_remedy(symptom.remedy(host))
+    .with_source(OpenSshOutput::new(said))
+}
+
 /// The one line worth putting in front of the user.
 ///
 /// `sftp` echoes each batch command it runs, and a changed host key prints a

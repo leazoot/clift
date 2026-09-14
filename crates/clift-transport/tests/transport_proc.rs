@@ -1,17 +1,18 @@
 //! The subprocess base, exercised against a real OpenSSH server.
 //!
 //! The unit tests in `proc.rs` pin down which arguments Clift generates. These
-//! check the other half: that those arguments actually carry awkward paths to a
-//! real server unchanged, and that a hung client is stopped rather than waited
-//! on forever.
+//! check the other half: that awkward paths reach a real server unchanged, and
+//! that a hung client is stopped rather than waited on forever.
 
 #![allow(clippy::unwrap_used)]
 
 #[path = "../../../tests/e2e/fixtures.rs"]
 mod fixtures;
 
+use clift_core::domain::RemotePath;
 use clift_core::ports::TransportTarget;
-use clift_transport::proc::{SftpBatch, SshRunner};
+use clift_transport::probe::OpenSshTransport;
+use clift_transport::proc::SshRunner;
 use fixtures::{SshdFixture, Topology, skip_without_docker};
 use std::time::{Duration, Instant};
 
@@ -60,20 +61,12 @@ fn paths_with_spaces_and_non_ascii_survive_the_round_trip() {
         return;
     }
     let fixture = SshdFixture::start(Topology::Normal);
-    let runner = runner(&fixture);
-    let target = target(&fixture);
+    let transport = OpenSshTransport::with_runner(runner(&fixture));
 
-    let directory = format!("{}/截图 目录 2", fixture.remote_home());
-    let mut batch = SftpBatch::new();
-    batch.push("mkdir", &[&directory]).unwrap();
-    batch.push("chmod", &["700", &directory]).unwrap();
-    let outcome = runner.run_sftp(&target, &batch).unwrap();
-    assert!(
-        outcome.succeeded(),
-        "sftp failed: {}\n{}",
-        outcome.stdout,
-        outcome.stderr
-    );
+    let directory = RemotePath::new(format!("{}/截图 目录 2", fixture.remote_home())).unwrap();
+    transport
+        .ensure_dir(&target(&fixture), &directory, 0o700)
+        .unwrap();
 
     let listing = fixture.ssh("ls -1 \"$HOME\"");
     assert_eq!(
@@ -91,36 +84,33 @@ fn quotes_backslashes_and_glob_characters_are_carried_literally() {
         return;
     }
     let fixture = SshdFixture::start(Topology::Normal);
-    let runner = runner(&fixture);
+    let transport = OpenSshTransport::with_runner(runner(&fixture));
     let target = target(&fixture);
 
-    // A name that would be mangled by a remote shell, by the local sftp
+    // A name that would be mangled by a remote shell, by a client-side
     // tokeniser, or by glob expansion, depending on which one is careless.
-    let awkward = format!(
+    let awkward = RemotePath::new(format!(
         "{}/it's \"a\" back\\slash *?[x] $HOME `id`",
         fixture.remote_home()
-    );
-    let decoy = format!(
+    ))
+    .unwrap();
+    let decoy = RemotePath::new(format!(
         "{}/it's \"a\" back\\slash ZZZZZZ $HOME `id`",
         fixture.remote_home()
-    );
-    let mut batch = SftpBatch::new();
-    batch.push("mkdir", &[&awkward]).unwrap();
-    batch.push("mkdir", &[&decoy]).unwrap();
-    assert!(runner.run_sftp(&target, &batch).unwrap().succeeded());
+    ))
+    .unwrap();
+    transport.ensure_dir(&target, &awkward, 0o700).unwrap();
+    transport.ensure_dir(&target, &decoy, 0o700).unwrap();
 
-    // `rmdir` on the globbed name must remove exactly one directory. If the
-    // metacharacters were expanded, the decoy would go too.
-    let mut removal = SftpBatch::new();
-    removal.push("rmdir", &[&awkward]).unwrap();
-    let outcome = runner.run_sftp(&target, &removal).unwrap();
-    assert!(outcome.succeeded(), "{}", outcome.stderr);
+    // Removing the globbed name must remove exactly one directory. If the
+    // metacharacters were expanded anywhere, the decoy would go too.
+    transport.remove(&target, &awkward).unwrap();
 
     let listing = fixture.ssh("ls -1 \"$HOME\"");
     let listing = String::from_utf8_lossy(&listing.stdout);
     assert!(
         listing.contains("ZZZZZZ"),
-        "the decoy was removed as well; the operand was expanded: {listing}"
+        "the decoy was removed as well; the path was expanded: {listing}"
     );
     assert!(
         !listing.contains("*?[x]"),

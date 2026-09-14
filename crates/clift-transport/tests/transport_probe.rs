@@ -12,8 +12,8 @@ mod fixtures;
 
 use clift_core::ports::{CheckStatus, ProbeReport, TransportTarget};
 use clift_transport::probe::{
-    CHECK_AUTHENTICATION, CHECK_CONNECTION, CHECK_HOST_KEY, CHECK_SFTP_CLIENT,
-    CHECK_SFTP_SUBSYSTEM, CHECK_SSH_CLIENT, OpenSshTransport,
+    CHECK_AUTHENTICATION, CHECK_CONNECTION, CHECK_HOST_KEY, CHECK_SFTP_SUBSYSTEM, CHECK_SSH_CLIENT,
+    OpenSshTransport,
 };
 use clift_transport::proc::SshRunner;
 use fixtures::{SshdFixture, Topology, skip_without_docker};
@@ -74,7 +74,6 @@ fn a_healthy_host_passes_every_check() {
 
     for name in [
         CHECK_SSH_CLIENT,
-        CHECK_SFTP_CLIENT,
         CHECK_CONNECTION,
         CHECK_HOST_KEY,
         CHECK_AUTHENTICATION,

@@ -1,68 +1,69 @@
 //! Remote directory operations, all of them over SFTP.
 //!
-//! Nothing here runs a remote shell. The specification requires paths to be passed as
-//! protocol fields rather than pasted into a command line, so every operation
-//! is an SFTP verb with quoted operands; `sftp` parses the batch locally and
-//! the server never sees the text.
-//!
-//! The one awkward part is reading metadata back. SFTP's client offers no
-//! `stat` command, only `ls -l`, so a single path is inspected by listing its
-//! parent. Modification times are rendered by the local `strftime`, which is
-//! why the runner pins the `sftp` child to UTC; see `SshRunner::run_sftp`.
+//! Nothing here runs a remote shell. Every path is a field of an SFTP request
+//! ([`crate::wire`]), and every piece of metadata is read from the attribute
+//! block the server returns: the permission bits as a number, the modification
+//! time as seconds since the epoch. There is no listing text to parse and no
+//! time zone to guess.
 
-use crate::errmap::{Symptom, classify, map_failure};
+use crate::errmap::{map_failure, map_refusal};
 use crate::probe::OpenSshTransport;
-use crate::proc::SftpBatch;
-use clift_core::calendar::{civil_from_days, days_from_civil, unix_seconds};
+use crate::session::{Failure, Refusal, SftpSession};
+use crate::wire::{Attrs, status};
 use clift_core::domain::{RemotePath, SafeFileName};
 use clift_core::error::{CliftError, ErrorKind, Remedy, Stage};
 use clift_core::ports::{ProbeReport, RemoteEntry, RemoteEntryKind, RemoteFs, TransportTarget};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
+
+const TYPE_MASK: u32 = 0o170_000;
+const TYPE_DIRECTORY: u32 = 0o040_000;
+const TYPE_FILE: u32 = 0o100_000;
+const TYPE_SYMLINK: u32 = 0o120_000;
+
+/// An operation's own verdict, or the session failure that prevented one.
+///
+/// The outer `Result` is the session: a broken one must reach the runner so
+/// that it is dropped. The inner one is what the operation found, such as a
+/// directory with the wrong permissions, which says nothing about the
+/// session.
+type Verdict<T> = Result<Result<T, CliftError>, Failure>;
 
 impl OpenSshTransport {
     /// The remote home directory, as an absolute path.
     ///
-    /// SFTP sessions start in the user's home, so its own idea of the working
-    /// directory is the answer. Asking a remote shell to echo `$HOME` would be
-    /// both a shell invocation and a worse answer.
+    /// SFTP sessions start in the user's home, so the server's resolution of
+    /// `.` is the answer. Asking a remote shell to echo `$HOME` would be both a
+    /// shell invocation and a worse answer.
     ///
     /// # Errors
     /// Fails when the host cannot be reached or reports a path that is not
     /// absolute.
     pub fn resolve_home(&self, target: &TransportTarget) -> Result<RemotePath, CliftError> {
-        let mut batch = SftpBatch::new();
-        batch.push("pwd", &[])?;
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if !outcome.succeeded() {
-            return Err(sftp_failed(
-                target,
-                "could not read the remote working directory",
-                &outcome.stderr,
-            ));
-        }
-
-        let reported = outcome
-            .stdout
-            .lines()
-            .find_map(|line| line.split_once("Remote working directory:"))
-            .map(|(_, path)| path.trim())
-            .ok_or_else(|| {
-                CliftError::new(
-                    Stage::Connect,
-                    ErrorKind::SshConnection,
-                    format!(
-                        "{} did not report a remote working directory",
-                        target.ssh_host()
-                    ),
-                )
+        let action = "could not read the remote home directory";
+        let reported = self
+            .runner()
+            .sftp(target, |session| session.realpath("."))
+            .map_err(|failure| {
+                self.runner()
+                    .session_error(target, Stage::Connect, action, failure)
             })?;
-
-        RemotePath::new(reported).map_err(|error| {
+        let text = String::from_utf8(reported).map_err(|error| {
+            CliftError::new(
+                Stage::Connect,
+                ErrorKind::RemoteDirectory,
+                format!(
+                    "{} reported a home directory that is not UTF-8",
+                    target.ssh_host()
+                ),
+            )
+            .with_source(error)
+        })?;
+        RemotePath::new(text).map_err(|error| {
             error
                 .into_clift(Stage::Connect, ErrorKind::RemoteDirectory)
                 .with_remedy(Remedy::new(
                     "Clift needs an absolute home directory. Check what the server reports:",
-                    format!("sftp {} <<< pwd", target.ssh_host()),
+                    format!("ssh {} pwd", target.ssh_host()),
                 ))
         })
     }
@@ -115,13 +116,12 @@ impl OpenSshTransport {
     /// be ordinary directories such as `~/.cache` that have every right to be
     /// group readable.
     ///
-    /// `mkdir` is asked before anything else, and its refusal carries the
-    /// answer that used to cost a `stat`: one request instead of the five a
-    /// directory listing costs, and it is the request that had to be made
-    /// anyway. It also settles the race that used to need a retry -- two
-    /// batches started on the same day share their date directory, and
-    /// whichever loses now gets a normal answer rather than an error
-    /// indistinguishable from a real one.
+    /// The directory is created with `mode` attached, and read back in the
+    /// same round trip. The pair settles both questions at once: whether this
+    /// call created it, and what its permissions are. A server applies its
+    /// umask to the requested mode, which can only make it stricter; one that
+    /// ignores the request altogether is caught by the read-back and corrected,
+    /// because the directory is Clift's own.
     ///
     /// # Errors
     /// Fails when `path` exists as something other than a directory, when it
@@ -132,185 +132,59 @@ impl OpenSshTransport {
         path: &RemotePath,
         mode: u32,
     ) -> Result<(), CliftError> {
-        let refusal = self.make_dir(target, path, mode)?;
-        match self.confirm_mode(target, path, mode, refusal.as_deref()) {
-            Ok(()) => Ok(()),
-            // A directory Clift did not create can be caught in the moment
-            // between another Clift's `mkdir` and its `chmod`, still wearing
-            // whatever the remote umask made it. The sftp client cannot create
-            // a directory and its permissions in one request, so that window
-            // is real, and looking once more is the only way to tell it from a
-            // directory that is genuinely wrong. One extra look, on a path
-            // that is already failing, and only for a directory Clift did not
-            // create -- one it did create has no such excuse.
-            Err(_maybe_still_settling) if refusal.is_some() => {
-                self.confirm_mode(target, path, mode, refusal.as_deref())
-            }
-            Err(wrong) => Err(wrong),
-        }
-    }
-
-    /// Creates `path` and any missing ancestors.
-    ///
-    /// Returns the server's own words when it declined to create `path`. That
-    /// usually means the directory is already there -- SFTP protocol 3 has no
-    /// distinct code for it -- but a full disk is worded the same way, so the
-    /// text is carried up rather than interpreted here.
-    fn make_dir(
-        &self,
-        target: &TransportTarget,
-        path: &RemotePath,
-        mode: u32,
-    ) -> Result<Option<String>, CliftError> {
-        match self.mkdir(target, path)? {
-            Made::Created => {
-                self.set_mode(target, path, mode)?;
-                Ok(None)
-            }
-            Made::Refused(reason) => Ok(Some(reason)),
-            Made::ParentMissing => {
-                let Some(parent) = parent_of(path) else {
-                    return Err(CliftError::new(
-                        Stage::Staging,
-                        ErrorKind::RemoteDirectory,
-                        format!("{path} has no existing ancestor on {}", target.ssh_host()),
-                    ));
-                };
-                // Only the ancestors Clift creates are given `mode`; the ones
-                // already there are checked and left alone. Each level asks
-                // the same question of the same server, so that rule carries
-                // down without being restated.
-                self.ensure_dir(target, &parent, mode)?;
-                match self.mkdir(target, path)? {
-                    Made::Created => {
-                        self.set_mode(target, path, mode)?;
-                        Ok(None)
-                    }
-                    Made::Refused(reason) => Ok(Some(reason)),
-                    // The parent is there now, so the same answer twice means
-                    // something is removing directories underneath us. That is
-                    // reported rather than chased.
-                    Made::ParentMissing => Err(CliftError::new(
-                        Stage::Staging,
-                        ErrorKind::RemoteDirectory,
-                        format!(
-                            "{path} still has no parent on {} after Clift created one",
-                            target.ssh_host()
-                        ),
-                    )),
-                }
-            }
-        }
-    }
-
-    /// Reads the mode back and holds it to `mode`.
-    ///
-    /// Creating a directory is not the same as it having the permissions asked
-    /// for: a remote umask, or a filesystem that does not carry permissions at
-    /// all, would both slip through without this.
-    fn confirm_mode(
-        &self,
-        target: &TransportTarget,
-        path: &RemotePath,
-        mode: u32,
-        refusal: Option<&str>,
-    ) -> Result<(), CliftError> {
-        match self.stat(target, path)? {
-            Some(entry) => check_existing(target, path, mode, &entry),
-            // Nothing is there, so "it already exists" was the wrong reading of
-            // the refusal. Whatever the server actually said is the answer.
-            None => match refusal {
-                Some(reason) => Err(sftp_failed(
-                    target,
-                    &format!("could not create {path}"),
-                    reason,
-                )),
-                None => Err(CliftError::new(
-                    Stage::Staging,
-                    ErrorKind::RemoteDirectory,
-                    format!("{path} was reported as created but is not there"),
-                )),
-            },
-        }
-    }
-
-    /// Runs one `mkdir` and reads the outcome off the server's answer.
-    fn mkdir(&self, target: &TransportTarget, path: &RemotePath) -> Result<Made, CliftError> {
-        let mut batch = SftpBatch::new();
-        batch.push("mkdir", &[path.as_str()])?;
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if outcome.succeeded() {
-            return Ok(Made::Created);
-        }
-        // The three answers OpenSSH 9.9 gives, collected from a real server:
-        //   remote mkdir "...": No such file or directory
-        //   remote mkdir "...": Permission denied
-        //   remote mkdir "...": Failure
-        // The last one is how protocol 3 says "it is already there", and also
-        // how it says several other things, so anything unrecognised joins it
-        // in the branch that looks rather than assumes.
-        match classify(&outcome.stderr) {
-            Symptom::RemoteMissing => Ok(Made::ParentMissing),
-            Symptom::RemotePermissionDenied => Err(sftp_failed(
+        match self
+            .runner()
+            .sftp(target, |session| ensure_in(session, target, path, mode))
+        {
+            Ok(verdict) => verdict,
+            Err(failure) => Err(self.runner().session_error(
                 target,
+                Stage::Staging,
                 &format!("could not create {path}"),
-                &outcome.stderr,
+                failure,
             )),
-            _ => Ok(Made::Refused(outcome.stderr)),
         }
-    }
-
-    /// Sets the permissions of a directory Clift has just created.
-    fn set_mode(
-        &self,
-        target: &TransportTarget,
-        path: &RemotePath,
-        mode: u32,
-    ) -> Result<(), CliftError> {
-        let mut batch = SftpBatch::new();
-        batch.push("chmod", &[&format!("{mode:o}"), path.as_str()])?;
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if outcome.succeeded() {
-            return Ok(());
-        }
-        Err(sftp_failed(
-            target,
-            &format!("could not set the permissions of {path}"),
-            &outcome.stderr,
-        ))
     }
 
     /// Metadata for one path, or `None` when it does not exist.
     ///
+    /// A symbolic link is reported as a link, never as what it points at.
+    ///
     /// # Errors
-    /// Fails when the parent directory cannot be listed for a reason other
-    /// than not existing.
+    /// Fails when the path cannot be inspected for a reason other than not
+    /// existing.
     pub fn stat(
         &self,
         target: &TransportTarget,
         path: &RemotePath,
     ) -> Result<Option<RemoteEntry>, CliftError> {
-        let Some(parent) = parent_of(path) else {
-            // Metadata is read by listing the parent, and the root has none.
-            // Nothing in Clift needs to stat `/`, and returning a made-up entry
-            // for it would be worse than saying so.
+        if parent_of(path).is_none() {
+            // Nothing in Clift needs to inspect `/`, and an entry for it would
+            // need a name it does not have.
             return Err(CliftError::new(
                 Stage::Staging,
                 ErrorKind::RemoteDirectory,
                 "the remote root directory cannot be inspected".to_string(),
             ));
-        };
-        let Some(wanted) = base_name(path) else {
+        }
+        // A name Clift cannot represent is reported as absent, as it is left
+        // out of listings: it is exactly the kind of entry cleanup must not act
+        // on.
+        let Some(name) = base_name(path).and_then(|name| SafeFileName::new(name).ok()) else {
             return Ok(None);
         };
-
-        let Some(entries) = self.list_raw(target, &parent)? else {
-            return Ok(None);
-        };
-        Ok(entries
-            .into_iter()
-            .find(|(name, _)| name == wanted)
-            .map(|(_, entry)| entry))
+        let attrs = self
+            .runner()
+            .sftp(target, |session| session.lstat(path.as_str()))
+            .map_err(|failure| {
+                self.runner().session_error(
+                    target,
+                    Stage::Staging,
+                    &format!("could not inspect {path}"),
+                    failure,
+                )
+            })?;
+        Ok(attrs.map(|attrs| entry(name, attrs)))
     }
 
     /// Lists a directory.
@@ -326,14 +200,35 @@ impl OpenSshTransport {
         target: &TransportTarget,
         path: &RemotePath,
     ) -> Result<Vec<RemoteEntry>, CliftError> {
-        match self.list_raw(target, path)? {
-            Some(entries) => Ok(entries.into_iter().map(|(_, entry)| entry).collect()),
-            None => Err(CliftError::new(
+        let listed = self
+            .runner()
+            .sftp(target, |session| session.list(path.as_str()))
+            .map_err(|failure| {
+                self.runner().session_error(
+                    target,
+                    Stage::Staging,
+                    &format!("could not list {path}"),
+                    failure,
+                )
+            })?;
+        let Some(names) = listed else {
+            return Err(CliftError::new(
                 Stage::Staging,
                 ErrorKind::RemoteDirectory,
                 format!("{path} does not exist on {}", target.ssh_host()),
-            )),
-        }
+            ));
+        };
+        Ok(names
+            .into_iter()
+            .filter_map(|listed| {
+                let name = String::from_utf8(listed.filename).ok()?;
+                if name == "." || name == ".." {
+                    return None;
+                }
+                let safe = SafeFileName::new(name).ok()?;
+                Some(entry(safe, listed.attrs))
+            })
+            .collect())
     }
 
     /// Removes a file, a symbolic link or an empty directory.
@@ -348,124 +243,158 @@ impl OpenSshTransport {
     /// # Errors
     /// Fails when the path exists but cannot be removed.
     pub fn remove(&self, target: &TransportTarget, path: &RemotePath) -> Result<(), CliftError> {
-        let Some(entry) = self.stat(target, path)? else {
-            return Ok(());
-        };
-        let verb = match entry.kind {
-            RemoteEntryKind::Directory => "rmdir",
-            _ => "rm",
-        };
-
-        let mut batch = SftpBatch::new();
-        batch.push(verb, &[path.as_str()])?;
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if outcome.succeeded() {
-            return Ok(());
-        }
-        Err(sftp_failed(
-            target,
-            &format!("could not remove {path}"),
-            &outcome.stderr,
-        ))
-    }
-
-    /// Lists a directory, returning `None` when it does not exist.
-    ///
-    /// Each entry is paired with its raw name so that `stat` can match on it
-    /// without going through [`SafeFileName`], which would drop exactly the
-    /// entries a caller may need to know about.
-    fn list_raw(
-        &self,
-        target: &TransportTarget,
-        path: &RemotePath,
-    ) -> Result<Option<Vec<(String, RemoteEntry)>>, CliftError> {
-        let mut batch = SftpBatch::new();
-        // `-a` is required: Clift's own intermediate uploads are dotfiles.
-        batch.push("ls", &["-la", path.as_str()])?;
-        let outcome = self.runner().run_sftp(target, &batch)?;
-        if !outcome.succeeded() {
-            if missing(&outcome.stderr) {
-                return Ok(None);
-            }
-            return Err(sftp_failed(
-                target,
-                &format!("could not list {path}"),
-                &outcome.stderr,
-            ));
-        }
-
-        let now = SystemTime::now();
-        let mut entries = Vec::new();
-        for line in outcome.stdout.lines() {
-            let Some(parsed) = parse_listing_line(line, now) else {
-                continue;
-            };
-            if parsed.name == "." || parsed.name == ".." {
-                continue;
-            }
-            // A name Clift cannot represent is left out rather than
-            // approximated: it is exactly the kind of entry cleanup must not
-            // act on.
-            let Ok(safe) = SafeFileName::new(parsed.name.clone()) else {
-                continue;
-            };
-            entries.push((
-                parsed.name,
-                RemoteEntry {
-                    name: safe,
-                    kind: parsed.kind,
-                    size: parsed.size,
-                    mode: parsed.mode,
-                    hidden_mode_bits: parsed.hidden_mode_bits,
-                    modified: parsed.modified,
-                },
-            ));
-        }
-        Ok(Some(entries))
+        self.runner()
+            .sftp(target, |session| {
+                let Some(attrs) = session.lstat(path.as_str())? else {
+                    return Ok(());
+                };
+                let removed = if kind_of(attrs) == RemoteEntryKind::Directory {
+                    session.rmdir(path.as_str())
+                } else {
+                    session.remove(path.as_str())
+                };
+                match removed {
+                    Err(Failure::Refused(refusal)) if refusal.code == status::NO_SUCH_FILE => {
+                        Ok(())
+                    }
+                    other => other,
+                }
+            })
+            .map_err(|failure| {
+                self.runner().session_error(
+                    target,
+                    Stage::Staging,
+                    &format!("could not remove {path}"),
+                    failure,
+                )
+            })
     }
 }
 
-/// What one `mkdir` says about the path it was given.
-enum Made {
-    /// It was not there, and now it is, created by this call.
-    Created,
-    /// The server declined, for a reason that is not a missing ancestor. The
-    /// usual one is that it is already there; the server's words are kept
-    /// because a full disk is worded identically.
-    Refused(String),
-    /// A component above it does not exist yet.
-    ParentMissing,
+/// `ensure_dir` inside a session.
+fn ensure_in(
+    session: &mut SftpSession,
+    target: &TransportTarget,
+    path: &RemotePath,
+    mode: u32,
+) -> Verdict<()> {
+    let (made, attrs) = session.mkdir_and_lstat(path.as_str(), mode)?;
+    let missing_parent = matches!(&made, Err(refusal) if refusal.code == status::NO_SUCH_FILE);
+    if !missing_parent {
+        return settle(session, target, path, mode, made, attrs);
+    }
+
+    let Some(parent) = parent_of(path) else {
+        return Ok(Err(CliftError::new(
+            Stage::Staging,
+            ErrorKind::RemoteDirectory,
+            format!("{path} has no existing ancestor on {}", target.ssh_host()),
+        )));
+    };
+    // Only the ancestors Clift creates are given `mode`; the ones already
+    // there are checked and left alone. Each level asks the same question of
+    // the same server, so that rule carries down without being restated.
+    if let Err(wrong) = ensure_in(session, target, &parent, mode)? {
+        return Ok(Err(wrong));
+    }
+    let (made, attrs) = session.mkdir_and_lstat(path.as_str(), mode)?;
+    match made {
+        // The parent is there now, so the same answer twice means something is
+        // removing directories underneath us. That is reported, not chased.
+        Err(refusal) if refusal.code == status::NO_SUCH_FILE => Ok(Err(CliftError::new(
+            Stage::Staging,
+            ErrorKind::RemoteDirectory,
+            format!(
+                "{path} still has no parent on {} after Clift created one",
+                target.ssh_host()
+            ),
+        ))),
+        made => settle(session, target, path, mode, made, attrs),
+    }
+}
+
+/// Decides what a `mkdir` and the read-back after it mean.
+fn settle(
+    session: &mut SftpSession,
+    target: &TransportTarget,
+    path: &RemotePath,
+    mode: u32,
+    made: Result<(), Refusal>,
+    attrs: Option<Attrs>,
+) -> Verdict<()> {
+    match (made, attrs) {
+        (Err(refusal), _) if refusal.code == status::PERMISSION_DENIED => Ok(Err(refused(
+            target,
+            &format!("could not create {path}"),
+            &refusal,
+        ))),
+        // Created by this call, so its permissions are Clift's to set.
+        (Ok(()), Some(attrs)) if kind_of(attrs) == RemoteEntryKind::Directory => {
+            if permissions(attrs) == Some(mode) {
+                return Ok(Ok(()));
+            }
+            match session.set_mode(path.as_str(), mode) {
+                Ok(()) => {}
+                Err(Failure::Refused(refusal)) => {
+                    return Ok(Err(refused(
+                        target,
+                        &format!("could not set the permissions of {path}"),
+                        &refusal,
+                    )));
+                }
+                Err(other) => return Err(other),
+            }
+            Ok(match session.lstat(path.as_str())? {
+                Some(after) => check_existing(target, path, mode, after),
+                None => Err(vanished(path)),
+            })
+        }
+        (Ok(()), Some(attrs)) => Ok(check_existing(target, path, mode, attrs)),
+        (Ok(()), None) => Ok(Err(vanished(path))),
+        // Nothing is there, so the refusal was not "it already exists".
+        // Whatever the server actually said is the answer.
+        (Err(refusal), None) => Ok(Err(refused(
+            target,
+            &format!("could not create {path}"),
+            &refusal,
+        ))),
+        // Already there, and not Clift's to change.
+        (Err(_), Some(attrs)) => match check_existing(target, path, mode, attrs) {
+            Ok(()) => Ok(Ok(())),
+            // A directory Clift did not create may be one another Clift has
+            // only just made, on a server that ignores the mode sent with
+            // `mkdir` and so needs a second request to set it. One more look,
+            // on a path that is already failing, tells that moment apart from
+            // a directory that is genuinely wrong.
+            Err(wrong) => Ok(match session.lstat(path.as_str())? {
+                Some(again) => check_existing(target, path, mode, again),
+                None => Err(wrong),
+            }),
+        },
+    }
 }
 
 fn check_existing(
     target: &TransportTarget,
     path: &RemotePath,
     mode: u32,
-    existing: &RemoteEntry,
+    existing: Attrs,
 ) -> Result<(), CliftError> {
-    if existing.kind != RemoteEntryKind::Directory {
+    if kind_of(existing) != RemoteEntryKind::Directory {
         return Err(CliftError::new(
             Stage::Staging,
             ErrorKind::RemoteDirectory,
             format!("{path} on {} is not a directory", target.ssh_host()),
         ));
     }
-    // Only what the listing showed can be compared, and the owner's bits must
-    // be among it: they are the ones that make a directory private at all.
-    let hidden = existing.hidden_mode_bits;
-    match existing.mode {
-        Some(actual) if hidden & 0o700 == 0 && actual & !hidden == mode & !hidden => Ok(()),
-        Some(actual) if hidden & 0o700 == 0 => Err(CliftError::new(
+    match permissions(existing) {
+        Some(actual) if actual == mode => Ok(()),
+        Some(actual) => Err(CliftError::new(
             Stage::Staging,
             ErrorKind::RemoteDirectory,
             format!(
-                "{path} on {} has mode {actual:04o}, but Clift requires {mode:04o}{}",
-                target.ssh_host(),
-                if hidden == 0 {
-                    ""
-                } else {
-                    " (the sftp client on this computer does not show group and other permissions)"
-                }
+                "{path} on {} has mode {actual:04o}, but Clift requires {mode:04o}",
+                target.ssh_host()
             ),
         )
         .with_remedy(Remedy::new(
@@ -473,7 +402,7 @@ fn check_existing(
              Set them yourself if that is what you want:",
             format!("ssh {} chmod {mode:o} {path}", target.ssh_host()),
         ))),
-        _ => Err(CliftError::new(
+        None => Err(CliftError::new(
             Stage::Staging,
             ErrorKind::RemoteDirectory,
             format!(
@@ -485,18 +414,50 @@ fn check_existing(
     }
 }
 
-fn sftp_failed(target: &TransportTarget, what: &str, stderr: &str) -> CliftError {
-    map_failure(target, Stage::Staging, what, stderr)
+fn refused(target: &TransportTarget, action: &str, refusal: &Refusal) -> CliftError {
+    map_refusal(
+        target,
+        Stage::Staging,
+        action,
+        refusal.code,
+        &refusal.message,
+    )
 }
 
-/// Whether an SFTP failure means "it is not there".
-///
-/// OpenSSH words this two ways depending on the operation: `ls` reports
-/// `Can't ls: "..." not found`, while the file operations report the errno text
-/// `No such file or directory`. Matching only the second is how `stat` on a
-/// missing directory turned into a transfer error instead of `Ok(None)`.
-fn missing(stderr: &str) -> bool {
-    classify(stderr) == Symptom::RemoteMissing
+fn vanished(path: &RemotePath) -> CliftError {
+    CliftError::new(
+        Stage::Staging,
+        ErrorKind::RemoteDirectory,
+        format!("{path} was reported as created but is not there"),
+    )
+}
+
+/// The permission bits, without the file type or the setuid, setgid and
+/// sticky bits: a directory inheriting setgid from its parent is still private
+/// when its owner, group and other bits say so.
+fn permissions(attrs: Attrs) -> Option<u32> {
+    attrs.permissions.map(|bits| bits & 0o777)
+}
+
+fn kind_of(attrs: Attrs) -> RemoteEntryKind {
+    match attrs.permissions.map(|bits| bits & TYPE_MASK) {
+        Some(TYPE_DIRECTORY) => RemoteEntryKind::Directory,
+        Some(TYPE_FILE) => RemoteEntryKind::File,
+        Some(TYPE_SYMLINK) => RemoteEntryKind::Symlink,
+        _ => RemoteEntryKind::Other,
+    }
+}
+
+fn entry(name: SafeFileName, attrs: Attrs) -> RemoteEntry {
+    RemoteEntry {
+        name,
+        kind: kind_of(attrs),
+        size: attrs.size.unwrap_or(0),
+        mode: permissions(attrs),
+        modified: attrs
+            .mtime
+            .map(|seconds| UNIX_EPOCH + Duration::from_secs(u64::from(seconds))),
+    }
 }
 
 /// The parent of an absolute path, or `None` for the root.
@@ -515,152 +476,6 @@ fn base_name(path: &RemotePath) -> Option<&str> {
     let cut = text.rfind('/')?;
     let name = &text[cut + 1..];
     if name.is_empty() { None } else { Some(name) }
-}
-
-/// One line of a listing, before it is checked against Clift's own rules.
-///
-/// Parsing and validation are separated because `.` and `..` are expected in
-/// every listing while being invalid [`SafeFileName`]s: folding the two steps
-/// together would make a normal entry indistinguishable from a suspicious one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedLine {
-    name: String,
-    kind: RemoteEntryKind,
-    size: u64,
-    mode: Option<u32>,
-    hidden_mode_bits: u32,
-    modified: Option<SystemTime>,
-}
-
-/// Parses one line of `ls -la` as `sftp` renders it.
-///
-/// The format is `mode links owner group size month day time-or-year name`,
-/// and the name may contain spaces, so eight fields are taken from the left and
-/// everything after them is the name. When a path argument was given, `sftp`
-/// prints each entry as a full path; the directory part is stripped so that
-/// callers always see a bare name.
-fn parse_listing_line(line: &str, now: SystemTime) -> Option<ParsedLine> {
-    let mut rest = line.trim_start();
-    let mut fields = Vec::with_capacity(8);
-    for _ in 0..8 {
-        let end = rest.find(char::is_whitespace)?;
-        fields.push(&rest[..end]);
-        rest = rest[end..].trim_start();
-    }
-    if rest.is_empty() {
-        return None;
-    }
-
-    let permissions = fields[0];
-    let kind = match permissions.chars().next()? {
-        'd' => RemoteEntryKind::Directory,
-        'l' => RemoteEntryKind::Symlink,
-        '-' => RemoteEntryKind::File,
-        _ => RemoteEntryKind::Other,
-    };
-    let size = fields[4].parse::<u64>().ok()?;
-    let modified = parse_timestamp(fields[5], fields[6], fields[7], now);
-
-    let raw = rest.to_string();
-    let name = raw.rsplit('/').next().unwrap_or(&raw).to_string();
-    if name.is_empty() {
-        return None;
-    }
-
-    let (mode, hidden_mode_bits) = match parse_mode(permissions) {
-        Some((mode, hidden)) => (Some(mode), hidden),
-        None => (None, 0),
-    };
-    Some(ParsedLine {
-        name,
-        kind,
-        size,
-        mode,
-        hidden_mode_bits,
-        modified,
-    })
-}
-
-/// Turns `drwx------` into `0o700`, together with the bits that were not shown.
-///
-/// The Windows build of OpenSSH's `sftp` prints `drwx******`: the owner's bits
-/// and nothing about group or other. Each `*` is a bit that client cannot see.
-/// It comes back in the second value, with zero in its place in the first.
-fn parse_mode(permissions: &str) -> Option<(u32, u32)> {
-    let bits: Vec<char> = permissions.chars().skip(1).take(9).collect();
-    if bits.len() != 9 {
-        return None;
-    }
-    let mut mode = 0;
-    let mut hidden = 0;
-    for (index, bit) in bits.iter().enumerate() {
-        let value = match index % 3 {
-            0 => 0o4,
-            1 => 0o2,
-            _ => 0o1,
-        } << (6 - 3 * (index / 3));
-        let set = match (index % 3, bit) {
-            (_, '*') => {
-                hidden |= value;
-                false
-            }
-            (_, '-') => false,
-            (0, 'r') | (1, 'w') => true,
-            // The execute column doubles as setuid, setgid and sticky.
-            (2, 'x' | 's' | 't') => true,
-            (2, 'S' | 'T') => false,
-            _ => return None,
-        };
-        if set {
-            mode |= value;
-        }
-    }
-    Some((mode, hidden))
-}
-
-/// Parses the three date fields `sftp` prints, which are rendered in UTC
-/// because the runner pins the child's `TZ`.
-///
-/// Two shapes exist: `Aug 30 12:34` for recent entries and `Feb 3 2023` for
-/// older ones. The recent form carries no year, so the year is chosen as the
-/// most recent one that does not put the entry in the future.
-fn parse_timestamp(month: &str, day: &str, last: &str, now: SystemTime) -> Option<SystemTime> {
-    let month = month_number(month)?;
-    let day: u32 = day.parse().ok()?;
-    let now_secs = unix_seconds(now);
-
-    let (year, hour, minute) = match last.split_once(':') {
-        Some((hour, minute)) => {
-            let (current_year, _, _) = civil_from_days(now_secs.div_euclid(86_400));
-            (current_year, hour.parse().ok()?, minute.parse().ok()?)
-        }
-        None => (last.parse().ok()?, 0, 0),
-    };
-
-    let seconds = |year: i64| -> i64 {
-        days_from_civil(year, month, day) * 86_400
-            + i64::from(hour) * 3_600
-            + i64::from(minute) * 60
-    };
-    let mut candidate = seconds(year);
-    if last.contains(':') && candidate > now_secs + 86_400 {
-        // A "recent" entry cannot be in the future; it is from last year.
-        candidate = seconds(year - 1);
-    }
-    if candidate < 0 {
-        return None;
-    }
-    Some(UNIX_EPOCH + Duration::from_secs(candidate as u64))
-}
-
-fn month_number(name: &str) -> Option<u32> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    MONTHS
-        .iter()
-        .position(|candidate| candidate.eq_ignore_ascii_case(name))
-        .map(|index| index as u32 + 1)
 }
 
 /// The port implementation, delegating to the inherent methods above.
@@ -717,8 +532,16 @@ impl RemoteFs for OpenSshTransport {
 mod tests {
     use super::*;
 
-    fn at(seconds: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(seconds)
+    fn target() -> TransportTarget {
+        TransportTarget::new("dev126")
+    }
+
+    fn attrs(bits: u32) -> Attrs {
+        Attrs {
+            size: Some(4096),
+            permissions: Some(bits),
+            mtime: Some(1_788_000_000),
+        }
     }
 
     #[test]
@@ -741,138 +564,48 @@ mod tests {
     }
 
     #[test]
-    fn permission_columns_become_octal_modes() {
-        assert_eq!(parse_mode("drwx------"), Some((0o700, 0)));
-        assert_eq!(parse_mode("-rw-------"), Some((0o600, 0)));
-        assert_eq!(parse_mode("drwxr-xr-x"), Some((0o755, 0)));
-        assert_eq!(parse_mode("-rw-rw-r--"), Some((0o664, 0)));
-        assert_eq!(parse_mode("drwxrwxrwt"), Some((0o777, 0)));
-        assert_eq!(parse_mode("short"), None);
-        // The Windows build of OpenSSH's sftp shows the owner's bits only.
-        assert_eq!(parse_mode("drwx******"), Some((0o700, 0o077)));
-        assert_eq!(parse_mode("-rw-******"), Some((0o600, 0o077)));
+    fn the_type_and_permission_bits_are_read_from_the_mode_number() {
+        assert_eq!(kind_of(attrs(0o040_700)), RemoteEntryKind::Directory);
+        assert_eq!(kind_of(attrs(0o100_600)), RemoteEntryKind::File);
+        assert_eq!(kind_of(attrs(0o120_777)), RemoteEntryKind::Symlink);
+        assert_eq!(kind_of(attrs(0o010_644)), RemoteEntryKind::Other);
+        assert_eq!(kind_of(Attrs::default()), RemoteEntryKind::Other);
+        assert_eq!(permissions(attrs(0o042_700)), Some(0o700));
     }
 
-    /// The exact bytes OpenSSH 9.9's sftp printed in the test container.
     #[test]
-    fn a_listing_line_is_split_into_metadata_and_a_name_that_may_contain_spaces() {
-        // 2026-08-31 04:20 UTC.
-        let now = at(1_788_150_000);
-        let parsed = parse_listing_line(
-            "drwx------    ? dev      dev          4096 Aug 30 17:10 .",
-            now,
-        )
-        .unwrap();
+    fn an_entry_carries_an_absolute_modification_time() {
+        let listed = entry(SafeFileName::new("shot.png").unwrap(), attrs(0o100_600));
+        assert_eq!(listed.kind, RemoteEntryKind::File);
+        assert_eq!(listed.mode, Some(0o600));
+        assert_eq!(listed.size, 4096);
         assert_eq!(
-            parsed.name, ".",
-            "'.' is parsed, then filtered by the caller"
-        );
-        assert_eq!(parsed.kind, RemoteEntryKind::Directory);
-        assert_eq!(parsed.mode, Some(0o700));
-        assert_eq!(parsed.size, 4096);
-
-        let parsed = parse_listing_line(
-            "-rw-------    ? dev      dev           182 Aug 30 12:34 /home/dev/a b 中文.png",
-            now,
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.name, "a b 中文.png",
-            "the directory part must be stripped and the spaces kept"
-        );
-        assert_eq!(parsed.kind, RemoteEntryKind::File);
-        assert_eq!(parsed.mode, Some(0o600));
-        assert_eq!(parsed.size, 182);
-        assert_eq!(
-            parsed
+            listed
                 .modified
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|since| since.as_secs()),
-            Some(1_788_093_240),
-            "2026-08-30 12:34 UTC"
+            Some(1_788_000_000)
         );
     }
 
-    /// The Windows build of OpenSSH's sftp shows only the owner's permission
-    /// bits and prints group and other as `*`. This is the exact line it
-    /// printed for a directory whose real mode was 0700.
     #[test]
-    fn a_windows_listing_line_reports_the_owner_bits_it_shows() {
-        let now = at(1_788_150_000);
-        let parsed = parse_listing_line(
-            "drwx******    ? root     root         4096 Sep 14 15:58 /root/.cache/clift",
-            now,
-        )
-        .unwrap();
-        assert_eq!(parsed.name, "clift");
-        assert_eq!(parsed.kind, RemoteEntryKind::Directory);
-        assert_eq!(parsed.size, 4096);
-        assert_eq!(parsed.mode, Some(0o700));
-        assert_eq!(
-            parsed.hidden_mode_bits, 0o077,
-            "group and other were not shown, which is not the same as clear"
-        );
-    }
-
-    /// Seen from Windows, a directory is held to the bits the client shows,
-    /// and never waved through on bits it hides.
-    #[test]
-    fn a_directory_seen_from_windows_is_judged_on_the_bits_it_shows() {
-        let target = TransportTarget::new("dev126");
+    fn an_existing_directory_is_held_to_every_permission_bit() {
         let path = RemotePath::new("/root/.cache/clift").unwrap();
-        let seen = |permissions: &str| {
-            let line = format!(
-                "{permissions}    ? root     root         4096 Sep 14 15:58 /root/.cache/clift"
-            );
-            let parsed = parse_listing_line(&line, at(1_788_150_000)).unwrap();
-            RemoteEntry {
-                name: SafeFileName::new(parsed.name).unwrap(),
-                kind: parsed.kind,
-                size: parsed.size,
-                mode: parsed.mode,
-                hidden_mode_bits: parsed.hidden_mode_bits,
-                modified: parsed.modified,
-            }
-        };
-
-        assert!(check_existing(&target, &path, 0o700, &seen("drwx******")).is_ok());
+        assert!(check_existing(&target(), &path, 0o700, attrs(0o040_700)).is_ok());
         assert!(
-            check_existing(&target, &path, 0o700, &seen("drw-******")).is_err(),
-            "the owner bits it does show still have to be right"
-        );
-        assert!(
-            check_existing(&target, &path, 0o700, &seen("d*********")).is_err(),
-            "a listing that shows no owner bits cannot vouch for anything"
-        );
-        assert!(
-            check_existing(&target, &path, 0o700, &seen("drwxr-xr-x")).is_err(),
-            "a full listing is still held to every bit"
-        );
-    }
-
-    #[test]
-    fn timestamps_are_read_back_as_the_utc_instant_sftp_rendered() {
-        let now = at(1_788_150_000);
-        let parsed = parse_timestamp("Aug", "30", "12:34", now).unwrap();
-        assert_eq!(
-            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            1_788_093_240
+            check_existing(&target(), &path, 0o700, attrs(0o042_700)).is_ok(),
+            "setgid inherited from a parent does not make a directory less private"
         );
 
-        let old = parse_timestamp("Feb", "3", "2023", now).unwrap();
-        assert_eq!(
-            old.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            1_675_382_400
-        );
-    }
+        let loose = check_existing(&target(), &path, 0o700, attrs(0o040_755)).unwrap_err();
+        assert_eq!(loose.exit_code().as_u8(), 25);
+        assert!(loose.message().contains("0755"), "{loose}");
+        assert!(loose.remedy().is_some());
 
-    #[test]
-    fn a_recent_timestamp_that_would_land_in_the_future_belongs_to_last_year() {
-        // "now" is 2026-01-05; an entry stamped 30 December is from 2025.
-        let now = at(1_767_571_200);
-        let parsed = parse_timestamp("Dec", "30", "10:00", now).unwrap();
-        let (year, month, day) =
-            civil_from_days(parsed.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 / 86_400);
-        assert_eq!((year, month, day), (2025, 12, 30));
+        let file = check_existing(&target(), &path, 0o700, attrs(0o100_700)).unwrap_err();
+        assert!(file.message().contains("not a directory"), "{file}");
+
+        let unreported = Attrs::default();
+        assert!(check_existing(&target(), &path, 0o700, unreported).is_err());
     }
 }

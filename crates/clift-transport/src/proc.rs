@@ -2,9 +2,9 @@
 //!
 //! Two rules shape everything here, and both come from the specification:
 //!
-//! 1. Clift drives the user's own `ssh` and `sftp` executables. It does not
-//!    link an SSH library, does not read key material and does not keep
-//!    credentials of its own.
+//! 1. Clift drives the user's own `ssh` executable. It does not link an SSH
+//!    library, does not read key material and does not keep credentials of
+//!    its own.
 //! 2. No argument Clift generates may weaken host key verification. Clift
 //!    generates exactly three `-o` options, and all three are the `Control*`
 //!    settings that reuse a connection. The
@@ -16,18 +16,19 @@
 //!
 //! Remote work goes through SFTP rather than a remote shell. A remote shell
 //! would mean pasting user-controlled paths into a command line the remote
-//! `sh` then re-parses, which the specification forbids; the SFTP client instead sends
-//! each path as its own protocol field. The batch language still needs
-//! quoting, because the local `sftp` client parses the batch script: see
-//! [`SftpBatch`].
+//! `sh` then re-parses, which the specification forbids. Over SFTP each path
+//! is its own length-prefixed protocol field, which `ssh` carries to the
+//! server's SFTP subsystem untouched; see [`crate::session`].
 
+use crate::errmap::{map_failure, map_refusal};
 use crate::reuse::Reuse;
-use crate::session::SftpSession;
+use crate::session::{Failure, SftpSession};
 use clift_core::error::{CliftError, ErrorKind, Remedy, Stage};
 use clift_core::ports::TransportTarget;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -45,10 +46,6 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// has no "wait with timeout", and a dependency for one is not worth it.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Whether a live `sftp` session can be read back while it runs; see
-/// [`SshRunner::with_sessions`].
-const SESSIONS_SUPPORTED: bool = !cfg!(windows);
-
 /// What an invocation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutcome {
@@ -65,11 +62,10 @@ impl CommandOutcome {
     }
 }
 
-/// Runs `ssh` and `sftp` on behalf of the transport adapter.
+/// Runs `ssh` on behalf of the transport adapter.
 #[derive(Debug, Clone)]
 pub struct SshRunner {
     ssh: PathBuf,
-    sftp: PathBuf,
     config_file: Option<PathBuf>,
     timeout: Duration,
     /// Connection reuse, when the caller asked for it.
@@ -79,7 +75,7 @@ pub struct SshRunner {
     /// about the machine, and asking `ssh -G` once per operation would undo
     /// part of what reuse is for.
     consulted: Arc<Mutex<HashMap<String, bool>>>,
-    /// One live `sftp` process per host, when the caller asked for it.
+    /// One live SFTP session per host, when the caller asked for it.
     /// Shared between clones for the same reason as `consulted`: a session is a
     /// property of this run against that host, not of whichever clone of the
     /// runner happens to be holding it.
@@ -93,13 +89,11 @@ impl Default for SshRunner {
 }
 
 impl SshRunner {
-    /// Uses the `ssh` and `sftp` found on `PATH` and the user's own SSH
-    /// configuration.
+    /// Uses the `ssh` found on `PATH` and the user's own SSH configuration.
     #[must_use]
     pub fn new() -> Self {
         Self {
             ssh: PathBuf::from("ssh"),
-            sftp: PathBuf::from("sftp"),
             config_file: None,
             timeout: DEFAULT_TIMEOUT,
             reuse: None,
@@ -124,28 +118,22 @@ impl SshRunner {
         self.reuse.as_ref()
     }
 
-    /// Keeps one `sftp` process open per host instead of starting one per
+    /// Keeps one SFTP session open per host instead of starting one per
     /// operation.
     ///
     /// Off unless asked for, so a caller that has not thought about it gets
-    /// the behaviour it had before. Nothing about the result changes: a
-    /// session runs the same commands and returns the same text, it just does
-    /// not pay for a new `sftp-server` on the far side each time.
-    ///
-    /// Never on Windows. The Windows build of OpenSSH's `sftp` holds what it
-    /// writes to a piped stdout until it exits, so the echo a session waits for
-    /// arrives only once the session is over, and every command would wait out
-    /// the timeout. There each operation runs its own `sftp`, whose output
-    /// comes back when it exits.
+    /// one connection per operation. Nothing about the result changes: the
+    /// same requests get the same answers, without a new connection and a new
+    /// `sftp-server` on the far side each time. On a client that cannot
+    /// multiplex, Windows among them, this is the difference between one
+    /// authentication per run and one per operation.
     #[must_use]
     pub fn with_sessions(mut self) -> Self {
-        if SESSIONS_SUPPORTED {
-            self.sessions = Some(Arc::new(Mutex::new(HashMap::new())));
-        }
+        self.sessions = Some(Arc::new(Mutex::new(HashMap::new())));
         self
     }
 
-    /// Whether this runner keeps `sftp` sessions open. Exposed so a caller can
+    /// Whether this runner keeps SFTP sessions open. Exposed so a caller can
     /// report what it did.
     #[must_use]
     pub const fn keeps_sessions(&self) -> bool {
@@ -189,15 +177,18 @@ impl SshRunner {
         args
     }
 
-    /// The exact argument list `sftp` would be given. The batch script itself
-    /// arrives on stdin, which is why `-b -` appears here.
+    /// The exact argument list `ssh` is given for an SFTP session.
+    ///
+    /// `-s` names a subsystem instead of a command, so nothing reaches a
+    /// remote shell: the server starts its own SFTP server and connects it to
+    /// the channel.
     #[must_use]
-    pub fn sftp_args(&self, target: &TransportTarget) -> Vec<OsString> {
+    pub fn subsystem_args(&self, target: &TransportTarget) -> Vec<OsString> {
         let mut args = self.config_args();
         args.extend(self.reuse_args(target));
-        args.push(OsString::from("-b"));
-        args.push(OsString::from("-"));
+        args.push(OsString::from("-s"));
         args.push(OsString::from(target.ssh_host()));
+        args.push(OsString::from("sftp"));
         args
     }
 
@@ -302,27 +293,11 @@ impl SshRunner {
         Ok(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 
-    /// Confirms the local `sftp` client exists and starts.
-    ///
-    /// `sftp` has no version flag; being able to run it at all is the whole
-    /// answer, so its usage message and non-zero status are both expected.
-    ///
-    /// # Errors
-    /// Fails when `sftp` cannot be started.
-    pub fn sftp_present(&self) -> Result<(), CliftError> {
-        Command::new(&self.sftp)
-            .arg("-h")
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| self.spawn_failed(&self.sftp, error))?;
-        Ok(())
-    }
-
     /// Runs a fixed command on the remote host.
     ///
     /// `command` is `&'static str` on purpose: a `format!` result cannot be
     /// passed, so no user-controlled path can reach the remote login shell.
-    /// Anything that involves a path must go through [`Self::run_sftp`].
+    /// Anything that involves a path must go through [`Self::sftp`].
     ///
     /// # Errors
     /// Fails when `ssh` cannot be started or does not finish within the
@@ -333,13 +308,7 @@ impl SshRunner {
         target: &TransportTarget,
         command: &'static str,
     ) -> Result<CommandOutcome, CliftError> {
-        self.run(
-            &self.ssh,
-            &self.ssh_args(target, command),
-            None,
-            target,
-            false,
-        )
+        self.run(&self.ssh, &self.ssh_args(target, command), target)
     }
 
     /// Asks the local `ssh` client what its configuration says about an alias.
@@ -351,142 +320,118 @@ impl SshRunner {
         &self,
         target: &TransportTarget,
     ) -> Result<CommandOutcome, CliftError> {
-        self.run(
-            &self.ssh,
-            &self.config_dump_args(target),
-            None,
-            target,
-            false,
-        )
+        self.run(&self.ssh, &self.config_dump_args(target), target)
     }
 
-    /// Runs a batch of SFTP commands against the remote host.
+    /// Runs `action` in an SFTP session with the host.
+    ///
+    /// With sessions kept, the session opened by the first operation serves
+    /// every later one. A kept session that has gone away in the meantime --
+    /// `ssh` exited, or an earlier operation broke it -- is replaced before
+    /// anything is sent on it, which is the only reopening there is: once a
+    /// request has been written, a failure is reported, never retried. A
+    /// session that breaks during `action` is dropped with the failure.
     ///
     /// # Errors
-    /// Fails when `sftp` cannot be started or does not finish within the
-    /// timeout.
-    pub fn run_sftp(
+    /// Returns the session's failure unchanged; [`Self::session_error`] turns
+    /// it into something a user can act on.
+    pub fn sftp<T>(
         &self,
         target: &TransportTarget,
-        batch: &SftpBatch,
-    ) -> Result<CommandOutcome, CliftError> {
-        if let Some(outcome) = self.run_sftp_in_session(target, batch) {
-            return outcome;
+        action: impl FnOnce(&mut SftpSession) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let Some(sessions) = &self.sessions else {
+            let mut session = self.open_session(target)?;
+            session.start_operation();
+            return action(&mut session);
+        };
+        let mut open = match sessions.lock() {
+            Ok(open) => open,
+            // A panic elsewhere cannot leave a map of sessions half-written in
+            // a way that matters: the worst case is a session that is not
+            // usable, and that is checked below.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let host = target.ssh_host().to_string();
+        let session = match open.entry(host.clone()) {
+            Entry::Occupied(entry) => {
+                let existing = entry.into_mut();
+                if !existing.is_usable() {
+                    *existing = self.open_session(target)?;
+                }
+                existing
+            }
+            Entry::Vacant(entry) => entry.insert(self.open_session(target)?),
+        };
+        session.start_operation();
+        let outcome = action(session);
+        if matches!(outcome, Err(Failure::Broken { .. })) {
+            open.remove(&host);
         }
-        self.run(
-            &self.sftp,
-            &self.sftp_args(target),
-            Some(batch.render()),
-            target,
-            true,
-        )
+        outcome
     }
 
-    /// Runs the batch in a live session, or reports that there was none to run
-    /// it in.
+    fn open_session(&self, target: &TransportTarget) -> Result<SftpSession, Failure> {
+        SftpSession::open(&self.ssh, &self.subsystem_args(target), self.timeout)
+    }
+
+    /// The error for a failed SFTP operation.
     ///
-    /// `None` means "no session was available" and asks the caller to do it the
-    /// one-shot way. It is returned only when nothing has reached the server,
-    /// so it can never turn into a silent retry of a batch that had already
-    /// begun -- mid-transfer retries are forbidden, and a `rename`
-    /// sent twice is exactly the kind of thing that forbids them.
-    fn run_sftp_in_session(
+    /// `action` is what Clift was trying to do, phrased for the user. A
+    /// refusal is the server's answer and keeps its words; a broken session is
+    /// classified by what `ssh` printed, exactly as a failed `ssh` command is,
+    /// so a rejected key or a missing subsystem reads the same either way.
+    #[must_use]
+    pub fn session_error(
         &self,
         target: &TransportTarget,
-        batch: &SftpBatch,
-    ) -> Option<Result<CommandOutcome, CliftError>> {
-        let sessions = self.sessions.as_ref()?;
-        let mut open = sessions.lock().ok()?;
-        let host = target.ssh_host().to_string();
-
-        // Two attempts, and only ever for a session that carried nothing: the
-        // first covers a session the server has since closed, the second is the
-        // one that reports the trouble.
-        for attempt in 0..2 {
-            if !open.contains_key(&host) {
-                let started = SftpSession::open(&self.sftp, &self.sftp_args(target), true).ok()?;
-                open.insert(host.clone(), started);
+        stage: Stage,
+        action: &str,
+        failure: Failure,
+    ) -> CliftError {
+        match failure {
+            Failure::Refused(refusal) => {
+                map_refusal(target, stage, action, refusal.code, &refusal.message)
             }
-            let session = open.get_mut(&host)?;
-            match session.run(batch, self.timeout) {
-                Ok(outcome) => {
-                    return Some(Ok(CommandOutcome {
-                        code: Some(i32::from(outcome.failed)),
-                        stdout: outcome.stdout,
-                        stderr: outcome.stderr,
-                    }));
-                }
-                Err(error) => {
-                    open.remove(&host);
-                    if error.started {
-                        return Some(Err(CliftError::new(
-                            Stage::Transfer,
-                            ErrorKind::Transfer,
-                            format!("{} while talking to {host}", error.message),
-                        )));
-                    }
-                    if attempt == 1 {
-                        return None;
-                    }
-                }
+            Failure::Broken {
+                timed_out: true, ..
+            } => self.timed_out(&self.ssh, target),
+            Failure::Broken { reason, stderr, .. } => {
+                let said = if stderr.trim().is_empty() {
+                    reason
+                } else {
+                    stderr
+                };
+                map_failure(target, stage, action, &said)
             }
+            Failure::NotStarted(error) => self.spawn_failed(&self.ssh, error),
+            Failure::Local(error) => CliftError::new(
+                Stage::Transfer,
+                ErrorKind::Transfer,
+                format!("{action}: the local file could not be read"),
+            )
+            .with_source(error),
         }
-        None
     }
 
     fn run(
         &self,
         program: &Path,
         args: &[OsString],
-        stdin_data: Option<String>,
         target: &TransportTarget,
-        timestamps_in_utc: bool,
     ) -> Result<CommandOutcome, CliftError> {
-        let mut command = Command::new(program);
-        command
+        let mut child = Command::new(program)
             .args(args)
-            .stdin(if stdin_data.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if timestamps_in_utc {
-            // `sftp` renders modification times with the *client's* local
-            // strftime, and the standard library cannot tell us what offset
-            // that was. Pinning the child to UTC makes the rendered time
-            // unambiguous, which is the only way to read it back as an absolute
-            // instant without adding a timezone dependency. It affects nothing
-            // else: the value is rendered locally and never reaches the server.
-            command.env("TZ", "UTC0");
-        }
-        let mut child = command
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| self.spawn_failed(program, error))?;
 
-        // The readers are drained on their own threads so that a child which
-        // fills its output pipe while we are still writing its input cannot
-        // deadlock against us.
+        // Drained on their own threads so that a child which fills one pipe
+        // while the other is being read cannot deadlock against us.
         let stdout_reader = spawn_reader(child.stdout.take());
         let stderr_reader = spawn_reader(child.stderr.take());
-
-        if let Some(data) = stdin_data {
-            let write_result = match child.stdin.take() {
-                Some(mut stdin) => stdin.write_all(data.as_bytes()),
-                None => Ok(()),
-            };
-            if let Err(error) = write_result {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CliftError::new(
-                    Stage::Connect,
-                    ErrorKind::SshConnection,
-                    format!("could not send the SFTP batch to {}", target.ssh_host()),
-                )
-                .with_source(error));
-            }
-        }
 
         let status = self.wait_with_timeout(&mut child, program, target)?;
 
@@ -611,103 +556,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     "no message".to_string()
 }
 
-/// A script for `sftp -b -`.
-///
-/// The remote side never sees this text: `sftp` parses it locally and sends
-/// each path as a protocol field. What it does mean is that the *local* client
-/// tokenises the script, so every operand has to be quoted for that
-/// tokeniser: including against glob expansion, which `sftp` applies to
-/// unquoted operands of `rm`, `ls` and `get`.
-#[derive(Debug, Clone, Default)]
-pub struct SftpBatch {
-    lines: Vec<String>,
-}
-
-impl SftpBatch {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Appends one command.
-    ///
-    /// The verb is `&'static str` for the same reason as in
-    /// [`SshRunner::run_ssh`]: it must never be assembled from user input.
-    ///
-    /// # Errors
-    /// Fails when an operand contains a character the batch language cannot
-    /// carry, which in practice means a control character such as a newline.
-    pub fn push(&mut self, verb: &'static str, operands: &[&str]) -> Result<(), CliftError> {
-        let mut line = String::from(verb);
-        for operand in operands {
-            line.push(' ');
-            line.push_str(&quote(operand)?);
-        }
-        self.lines.push(line);
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// The commands, one at a time.
-    ///
-    /// A live session sends them individually so that it can stop at the first
-    /// failure the way the one-shot client stops on a batch script; see
-    /// [`crate::session`].
-    #[must_use]
-    pub fn commands(&self) -> &[String] {
-        &self.lines
-    }
-
-    /// The script as `sftp` will read it.
-    #[must_use]
-    pub fn render(&self) -> String {
-        let mut script = String::new();
-        for line in &self.lines {
-            script.push_str(line);
-            script.push('\n');
-        }
-        script
-    }
-}
-
-/// Quotes one operand for the `sftp` batch tokeniser.
-///
-/// Inside double quotes `sftp` treats only `\` and `"` as special and performs
-/// no glob expansion, so wrapping and escaping those two characters is enough.
-///
-/// # Errors
-/// Fails on a control character: a newline would end the command and a NUL
-/// cannot be transported at all. Remote names are sanitised before they reach
-/// here, so this is a defence in depth rather than the primary check.
-pub fn quote(operand: &str) -> Result<String, CliftError> {
-    if let Some(offending) = operand.chars().find(|character| character.is_control()) {
-        return Err(CliftError::new(
-            Stage::Transfer,
-            ErrorKind::Transfer,
-            format!(
-                "a remote path contains the control character U+{:04X}, which SFTP batch mode \
-                 cannot carry",
-                offending as u32
-            ),
-        ));
-    }
-
-    let mut quoted = String::with_capacity(operand.len() + 2);
-    quoted.push('"');
-    for character in operand.chars() {
-        if character == '"' || character == '\\' {
-            quoted.push('\\');
-        }
-        quoted.push(character);
-    }
-    quoted.push('"');
-    Ok(quoted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,21 +570,18 @@ mod tests {
         assert_eq!(runner.ssh_args(&target(), "true"), vec!["core", "true"]);
     }
 
-    /// A session is kept only where `sftp` output can be read as it arrives,
-    /// which the Windows build of OpenSSH does not allow.
+    /// Sessions are kept on every platform once asked for: SFTP spoken over
+    /// `ssh` arrives as it is written everywhere, Windows included.
     #[test]
-    fn sessions_are_kept_only_where_sftp_output_arrives_as_it_is_written() {
-        assert_eq!(
-            SshRunner::new().with_sessions().keeps_sessions(),
-            !cfg!(windows)
-        );
+    fn sessions_are_kept_when_asked_for_and_only_then() {
+        assert!(SshRunner::new().with_sessions().keeps_sessions());
         assert!(!SshRunner::new().keeps_sessions(), "off unless asked for");
     }
 
     #[test]
-    fn sftp_reads_its_batch_from_stdin() {
+    fn sftp_is_asked_for_as_a_subsystem_not_as_a_command() {
         let runner = SshRunner::new();
-        assert_eq!(runner.sftp_args(&target()), vec!["-b", "-", "core"]);
+        assert_eq!(runner.subsystem_args(&target()), vec!["-s", "core", "sftp"]);
     }
 
     /// A runner that will not consult `ssh` about the host, because the answer
@@ -779,7 +624,7 @@ mod tests {
         ];
         for runner in runners {
             let mut all = runner.ssh_args(&target(), "true");
-            all.extend(runner.sftp_args(&target()));
+            all.extend(runner.subsystem_args(&target()));
             all.extend(runner.config_dump_args(&target()));
 
             let rendered: Vec<String> = all
@@ -803,14 +648,14 @@ mod tests {
                 .iter()
                 .filter(|text| text.starts_with('-') && *text != "-")
                 .collect();
-            // -F names the config file, -b feeds sftp its batch on stdin, -G
+            // -F names the config file, -s asks for the SFTP subsystem, -G
             // asks ssh to print the configuration it resolved, -o carries the
             // three above. None of them changes what is verified about the
             // host.
             assert!(
                 flags
                     .iter()
-                    .all(|flag| ["-F", "-b", "-G", "-o"].contains(&flag.as_str())),
+                    .all(|flag| ["-F", "-s", "-G", "-o"].contains(&flag.as_str())),
                 "unexpected flag in {flags:?}"
             );
         }
@@ -839,14 +684,14 @@ mod tests {
         );
 
         let sftp: Vec<String> = runner
-            .sftp_args(&target())
+            .subsystem_args(&target())
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(sftp.last().map(String::as_str), Some("core"));
+        assert_eq!(sftp.last().map(String::as_str), Some("sftp"));
         assert!(
             sftp.contains(&"ControlPath=/run/clift/%C".to_string()),
-            "sftp shares the master too, or eight of the nine sessions are unaffected: {sftp:?}"
+            "the SFTP session shares the master too: {sftp:?}"
         );
     }
 
@@ -862,7 +707,7 @@ mod tests {
                 "Clift overrode the user's own ControlMaster"
             );
         }
-        for argument in runner.sftp_args(&target()) {
+        for argument in runner.subsystem_args(&target()) {
             assert_ne!(argument, "-o");
         }
     }
@@ -884,51 +729,6 @@ mod tests {
         assert_eq!(
             runner.ssh_args(&target(), "true"),
             vec!["-F", "/tmp/x/ssh_config", "core", "true"]
-        );
-    }
-
-    #[test]
-    fn quoting_wraps_and_escapes_only_what_the_tokeniser_needs() {
-        assert_eq!(quote("plain").unwrap(), "\"plain\"");
-        assert_eq!(quote("a b").unwrap(), "\"a b\"");
-        assert_eq!(quote("截图 2.png").unwrap(), "\"截图 2.png\"");
-        assert_eq!(quote("it's").unwrap(), "\"it's\"");
-        assert_eq!(quote("say \"hi\"").unwrap(), "\"say \\\"hi\\\"\"");
-        assert_eq!(quote("back\\slash").unwrap(), "\"back\\\\slash\"");
-        // Glob metacharacters need no escape of their own: sftp does not
-        // expand them inside quotes.
-        assert_eq!(quote("star*x?[a]").unwrap(), "\"star*x?[a]\"");
-    }
-
-    #[test]
-    fn quoting_refuses_control_characters() {
-        for input in ["line\nbreak", "tab\there", "nul\0byte"] {
-            let error = quote(input).unwrap_err();
-            assert_eq!(error.exit_code().as_u8(), 23, "{input:?}");
-            assert!(error.message().contains("control character"), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_batch_renders_one_command_per_line() {
-        let mut batch = SftpBatch::new();
-        assert!(batch.is_empty());
-        batch.push("mkdir", &["/home/dev/a b"]).unwrap();
-        batch.push("chmod", &["700", "/home/dev/a b"]).unwrap();
-        batch.push("quit", &[]).unwrap();
-        assert_eq!(
-            batch.render(),
-            "mkdir \"/home/dev/a b\"\nchmod \"700\" \"/home/dev/a b\"\nquit\n"
-        );
-    }
-
-    #[test]
-    fn a_control_character_stops_the_whole_batch_rather_than_being_stripped() {
-        let mut batch = SftpBatch::new();
-        assert!(batch.push("mkdir", &["/home/dev/a\nrm -rf /"]).is_err());
-        assert!(
-            batch.is_empty(),
-            "a rejected command must not be half-written into the batch"
         );
     }
 }

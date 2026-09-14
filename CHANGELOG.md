@@ -7,27 +7,31 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Fast Mode speaks SFTP itself, over the system `ssh` (`ssh -s <host> sftp`),
+  instead of driving the `sftp` program and reading what it prints. Reaching
+  and trusting the host is still entirely `ssh`'s job: your configuration,
+  known_hosts, agent, hardware keys and ProxyJump all apply as before. A send
+  is now one connection and one SFTP session on every platform, including
+  clients that cannot reuse connections, and the `sftp` program is no longer
+  needed. `doctor` drops its "sftp client" check and reports twelve.
+
 ### Fixed
 
-- On Windows, setting up a Fast Mode host stopped at "Asking … where home is"
-  or "Creating a directory" and waited out long timeouts. To avoid starting a
-  new `sftp` for every step, Clift keeps one open and reads each answer as it
-  arrives, but the Windows build of OpenSSH holds that output until `sftp`
-  exits. On Windows each step now runs its own `sftp`. Replies are also read
-  correctly when their lines end in `\r\n`, and a reply whose two halves
-  arrived apart is no longer lost while Clift waits for the second one.
-- On Windows, setup then stopped with "did not report the permissions". The
-  Windows `sftp` client prints group and other permissions as `*`, so from there
-  `0700` and `0777` look the same. Clift now checks the owner's permissions it
-  can see and still refuses anything wrong there, and `setup` and `doctor` say
-  plainly that group and other could not be checked, with a command that shows
-  them. Directories Clift creates are still set to `0700` by Clift itself.
-- When the first SFTP command of a step outlasted the two-minute limit, Clift
-  took it as never sent and sent the step again, in a new session and then in
-  a one-shot `sftp`. By then `sftp` had already taken the command and could
-  have carried it out on the server, so a `rename` could happen twice. A
-  command `sftp` has taken is now reported as failed and never sent again;
-  only a command it never read is tried once more.
+- On Windows a Fast Mode send took close to a minute, and setup could stall at
+  "Creating a directory". The Windows build of `sftp` holds its output until it
+  exits, so every step of a send became a new process and a new login. A send
+  now logs in once.
+- On Windows, sending a file by path failed with `stat ////?//D://...`: the
+  path reached `sftp` in a form it could not read. Clift now reads the file
+  itself and sends its bytes.
+- Directories and uploaded files are created with their permissions in the
+  same request, and permissions are read as numbers the server reports rather
+  than from a listing, which the Windows client printed as `drwx******`.
+- A request still waiting for the server when the time limit ran out could be
+  sent again, so a `rename` could happen twice. A request that has been sent is
+  now reported as failed and never repeated.
 
 ## [0.1.1] - 2026-09-08
 

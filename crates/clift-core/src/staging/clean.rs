@@ -283,7 +283,6 @@ mod tests {
             kind,
             size: 10,
             mode: Some(0o700),
-            hidden_mode_bits: 0,
             modified,
         }
     }

@@ -17,11 +17,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-const CHECK_NAMES: [&str; 13] = [
+const CHECK_NAMES: [&str; 12] = [
     "platform",
     "clipboard",
     "ssh client",
-    "sftp client",
     "host resolution",
     "authentication",
     "sftp subsystem",
@@ -135,7 +134,7 @@ fn status_of(value: &serde_json::Value, name: &str) -> String {
 /// On a machine with nothing configured, every check is still reported and the
 /// advice is about configuring a host rather than about a host being broken.
 #[test]
-fn a_fresh_machine_gets_thirteen_lines_and_a_way_forward() {
+fn a_fresh_machine_gets_twelve_lines_and_a_way_forward() {
     let output = run_isolated(&["doctor"]);
     let text = stderr_of(&output);
 
@@ -158,7 +157,7 @@ fn the_json_report_is_one_document_with_every_check() {
 
     assert_eq!(value["schema_version"], 1);
     let checks = value["checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 13);
+    assert_eq!(checks.len(), 12);
     assert_eq!(checks[0]["name"], "platform");
     assert_eq!(checks[0]["status"], "pass");
 
@@ -196,7 +195,6 @@ fn a_working_host_passes_the_remote_checks_and_warns_about_what_is_missing() {
 
     for name in [
         "ssh client",
-        "sftp client",
         "host resolution",
         "authentication",
         "sftp subsystem",
@@ -237,7 +235,7 @@ fn a_broken_host_fails_the_right_line_and_still_reports_the_others() {
     let text = String::from_utf8(output.stdout.clone()).unwrap();
     let value: serde_json::Value = serde_json::from_str(&text).expect("one JSON document");
     let checks = value["checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 13, "every check is still reported");
+    assert_eq!(checks.len(), 12, "every check is still reported");
     assert!(value["failures"].as_u64().unwrap() > 0, "{text}");
     assert_eq!(output.status.code(), Some(30));
 

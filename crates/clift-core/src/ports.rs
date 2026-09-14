@@ -133,13 +133,6 @@ pub struct RemoteEntry {
     /// Present so that a directory which already exists with the wrong
     /// permissions can be refused rather than silently tightened.
     pub mode: Option<u32>,
-    /// Permission bits the listing did not show, as a mask over `mode`.
-    ///
-    /// Zero when every bit was shown. The Windows build of OpenSSH's `sftp`
-    /// prints the group and other columns as `*`, so from there this is
-    /// `0o077`. A bit set here is unknown rather than clear, and `mode` holds
-    /// zero in its place.
-    pub hidden_mode_bits: u32,
     /// Needed by retention-based cleanup; absent when the server does not
     /// report it.
     pub modified: Option<SystemTime>,
