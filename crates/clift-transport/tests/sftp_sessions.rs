@@ -28,6 +28,59 @@ use clift_transport::probe::OpenSshTransport;
 use clift_transport::proc::{SftpBatch, SshRunner};
 use fixtures::{SshdFixture, Topology, skip_without_docker};
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// A command still running on the server when the timeout arrives is reported,
+/// never sent again. `sftp` had already taken it, so it may have done its work
+/// there; for a `rename` a second attempt is a second rename.
+///
+/// The command is a `put` into a FIFO. The server's `open` blocks until
+/// something reads the other end, and nothing does, so the command is stuck on
+/// the server itself rather than slow on the way. Every attempt to send it
+/// again, in a new session or in a one-shot `sftp`, starts another subsystem
+/// and shows up in sshd's log.
+#[test]
+fn a_command_that_outlasts_the_timeout_is_not_sent_again() {
+    if skip_without_docker("a_command_that_outlasts_the_timeout_is_not_sent_again") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let fifo = format!("{}/stuck", fixture.remote_home());
+    let made = fixture.ssh(&format!("mkfifo {fifo}"));
+    assert!(made.status.success(), "mkfifo failed: {made:?}");
+    let payload = fixture.workdir().join("payload.bin");
+    std::fs::write(&payload, b"one attachment").unwrap();
+
+    let timeout = Duration::from_secs(2);
+    let runner = SshRunner::new()
+        .with_config_file(fixture.ssh_config())
+        .with_sessions()
+        .with_timeout(timeout);
+    let mut batch = SftpBatch::new();
+    batch
+        .push("put", &[payload.to_str().unwrap(), fifo.as_str()])
+        .unwrap();
+
+    let before = sftp_sessions(&fixture);
+    let started = Instant::now();
+    let error = runner
+        .run_sftp(&target, &batch)
+        .expect_err("a put that never finishes cannot succeed");
+    let elapsed = started.elapsed();
+    let after = sftp_sessions(&fixture);
+
+    assert_eq!(
+        after - before,
+        1,
+        "the stuck put was sent again after {elapsed:?}: {error}"
+    );
+    assert!(
+        elapsed < timeout * 2,
+        "one timeout is the whole wait, not one per attempt: {elapsed:?}"
+    );
+    assert_eq!(error.exit_code().as_u8(), 23, "{error}");
+}
 
 /// How many times the server was asked to start an sftp subsystem.
 ///

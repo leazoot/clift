@@ -65,6 +65,11 @@ const TOKEN_BYTES: usize = 8;
 /// How often the streams are checked while a command is in flight.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+/// How long a stopped client's stdout may take to close. It closes as soon as
+/// the process is gone; the limit is for anything else still holding the pipe,
+/// and running out of it counts the command as sent.
+const END_OF_OUTPUT_WAIT: Duration = Duration::from_secs(2);
+
 /// What `sftp` printed for one batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOutcome {
@@ -78,9 +83,10 @@ pub struct SessionOutcome {
 /// Why a session could not carry a batch.
 ///
 /// The distinction is the whole point of the type: `started` says whether any
-/// command reached the server. Nothing may be retried once it did, because
-/// retrying a partly executed batch is exactly the automatic mid-transfer
-/// retry that the specification forbids.
+/// command may have reached the server, which is true from the moment `sftp`
+/// has read one. Nothing may be retried once it has, because retrying a partly
+/// executed batch is exactly the automatic mid-transfer retry that the
+/// specification forbids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionError {
     pub started: bool,
@@ -204,27 +210,25 @@ impl SftpSession {
         timeout: Duration,
         started: bool,
     ) -> Result<Frame, SessionError> {
-        let fail = |message: String| {
-            if started {
-                SessionError::midway(message)
-            } else {
-                SessionError::before_anything_ran(message)
-            }
-        };
-
         // The leading `-` on both lines: see the module documentation. It is
         // what keeps an expected failure from ending the session.
         let script = format!("-{command}\n-{}\n", self.fence);
         let Some(stdin) = self.stdin.as_mut() else {
-            return Err(fail("the sftp session has already been closed".to_string()));
+            let message = "the sftp session has already been closed";
+            return Err(if started {
+                SessionError::midway(message)
+            } else {
+                SessionError::before_anything_ran(message)
+            });
         };
-        if let Err(error) = stdin
+        let written = stdin
             .write_all(script.as_bytes())
-            .and_then(|()| stdin.flush())
-        {
-            return Err(fail(format!(
-                "could not write to the sftp session: {error}"
-            )));
+            .and_then(|()| stdin.flush());
+        if let Err(error) = written {
+            return Err(self.abandon(
+                started,
+                format!("could not write to the sftp session: {error}"),
+            ));
         }
 
         let deadline = Instant::now() + timeout;
@@ -246,22 +250,56 @@ impl SftpSession {
                 let said = String::from_utf8_lossy(&self.pending_err)
                     .trim()
                     .to_string();
-                return Err(fail(format!(
-                    "the sftp session ended ({status}){}",
-                    if said.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {said}")
-                    }
-                )));
+                return Err(self.abandon(
+                    started,
+                    format!(
+                        "the sftp session ended ({status}){}",
+                        if said.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {said}")
+                        }
+                    ),
+                ));
             }
             if Instant::now() >= deadline {
-                return Err(fail(format!(
-                    "the sftp session did not answer within {} seconds",
-                    timeout.as_secs()
-                )));
+                return Err(self.abandon(
+                    started,
+                    format!(
+                        "the sftp session did not answer within {} seconds",
+                        timeout.as_secs()
+                    ),
+                ));
             }
             thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Ends a session whose command could not be seen through, and decides
+    /// whether that command may have run.
+    ///
+    /// Having been written is not the test: a command written into the pipe
+    /// may still be waiting there while the client connects. Having been read
+    /// is. `sftp` echoes each command on stdout before it performs it, and its
+    /// stdout is line buffered, so a command that got as far as the server was
+    /// echoed first. With the client stopped and its stdout closed, an empty
+    /// stdout therefore means the command was never taken. Anything else
+    /// counts as sent, including a pipe that would not close: sending a
+    /// command twice is what this exists to prevent, and an error that a
+    /// second attempt might have avoided is the cheaper mistake.
+    fn abandon(&mut self, started: bool, message: String) -> SessionError {
+        self.stdin = None;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if started {
+            return SessionError::midway(message);
+        }
+        let closed = self.stdout.wait_for_end(END_OF_OUTPUT_WAIT);
+        self.pending_out.extend_from_slice(&self.stdout.take());
+        if closed && self.pending_out.is_empty() {
+            SessionError::before_anything_ran(message)
+        } else {
+            SessionError::midway(message)
         }
     }
 }
@@ -363,13 +401,14 @@ fn fence_token() -> String {
 #[derive(Debug)]
 struct Stream {
     buffer: Arc<Mutex<Vec<u8>>>,
+    reader: thread::JoinHandle<()>,
 }
 
 impl Stream {
     fn draining<R: Read + Send + 'static>(mut source: R) -> Self {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&buffer);
-        thread::spawn(move || {
+        let reader = thread::spawn(move || {
             let mut chunk = [0_u8; 4096];
             loop {
                 match source.read(&mut chunk) {
@@ -381,7 +420,19 @@ impl Stream {
                 }
             }
         });
-        Self { buffer }
+        Self { buffer, reader }
+    }
+
+    /// Waits up to `limit` for the pipe to close, and says whether it did.
+    fn wait_for_end(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while !self.reader.is_finished() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        true
     }
 
     /// Everything read since the last call.
@@ -488,6 +539,50 @@ mod tests {
         let frame = cut_frame(&mut stdout, &mut stderr, "tok")
             .unwrap_or_else(|| panic!("both halves have arrived"));
         assert_eq!(frame.stdout, "Remote working directory: /root\n");
+    }
+
+    #[cfg(unix)]
+    fn a_rename() -> SftpBatch {
+        let mut batch = SftpBatch::new();
+        batch
+            .push("rename", &["/inbox/.a.part", "/inbox/a.png"])
+            .unwrap();
+        batch
+    }
+
+    /// `sftp` echoes a command before it runs it, so a client that echoed the
+    /// command may already have sent it to the server. `cat` stands in for
+    /// that client: it takes the command and echoes it, but never produces
+    /// the fence's `Invalid command.`, so the command runs into the timeout.
+    /// Starting over from there would send the rename a second time.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_the_client_took_counts_as_sent_even_when_it_never_answers() {
+        let mut session = SftpSession::open(Path::new("cat"), &[], false).unwrap();
+        let error = session
+            .run(&a_rename(), Duration::from_millis(300))
+            .unwrap_err();
+        assert!(
+            error.started,
+            "a command the client had already taken was reported as never sent: {error:?}"
+        );
+    }
+
+    /// The other side of the same line: a client that exits without having
+    /// read its input, the way `sftp` does when authentication fails, has run
+    /// nothing, and the caller may still start over.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_the_client_never_took_may_be_sent_again() {
+        let mut session =
+            SftpSession::open(Path::new("sleep"), &[OsString::from("30")], false).unwrap();
+        let error = session
+            .run(&a_rename(), Duration::from_millis(300))
+            .unwrap_err();
+        assert!(
+            !error.started,
+            "a command nothing had read was reported as sent: {error:?}"
+        );
     }
 
     /// The token guards against a remote file name forging a frame marker, so

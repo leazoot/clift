@@ -22,6 +22,12 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   can see and still refuses anything wrong there, and `setup` and `doctor` say
   plainly that group and other could not be checked, with a command that shows
   them. Directories Clift creates are still set to `0700` by Clift itself.
+- When the first SFTP command of a step outlasted the two-minute limit, Clift
+  took it as never sent and sent the step again, in a new session and then in
+  a one-shot `sftp`. By then `sftp` had already taken the command and could
+  have carried it out on the server, so a `rename` could happen twice. A
+  command `sftp` has taken is now reported as failed and never sent again;
+  only a command it never read is tried once more.
 
 ## [0.1.1] - 2026-09-08
 
