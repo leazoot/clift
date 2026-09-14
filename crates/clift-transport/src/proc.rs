@@ -45,6 +45,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// has no "wait with timeout", and a dependency for one is not worth it.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Whether a live `sftp` session can be read back while it runs; see
+/// [`SshRunner::with_sessions`].
+const SESSIONS_SUPPORTED: bool = !cfg!(windows);
+
 /// What an invocation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutcome {
@@ -127,10 +131,25 @@ impl SshRunner {
     /// the behaviour it had before. Nothing about the result changes: a
     /// session runs the same commands and returns the same text, it just does
     /// not pay for a new `sftp-server` on the far side each time.
+    ///
+    /// Never on Windows. The Windows build of OpenSSH's `sftp` holds what it
+    /// writes to a piped stdout until it exits, so the echo a session waits for
+    /// arrives only once the session is over, and every command would wait out
+    /// the timeout. There each operation runs its own `sftp`, whose output
+    /// comes back when it exits.
     #[must_use]
     pub fn with_sessions(mut self) -> Self {
-        self.sessions = Some(Arc::new(Mutex::new(HashMap::new())));
+        if SESSIONS_SUPPORTED {
+            self.sessions = Some(Arc::new(Mutex::new(HashMap::new())));
+        }
         self
+    }
+
+    /// Whether this runner keeps `sftp` sessions open. Exposed so a caller can
+    /// report what it did.
+    #[must_use]
+    pub const fn keeps_sessions(&self) -> bool {
+        self.sessions.is_some()
     }
 
     /// Reads SSH configuration from `path` instead of the user's own.
@@ -701,6 +720,17 @@ mod tests {
     fn ssh_is_given_the_host_and_the_command_and_nothing_else() {
         let runner = SshRunner::new();
         assert_eq!(runner.ssh_args(&target(), "true"), vec!["core", "true"]);
+    }
+
+    /// A session is kept only where `sftp` output can be read as it arrives,
+    /// which the Windows build of OpenSSH does not allow.
+    #[test]
+    fn sessions_are_kept_only_where_sftp_output_arrives_as_it_is_written() {
+        assert_eq!(
+            SshRunner::new().with_sessions().keeps_sessions(),
+            !cfg!(windows)
+        );
+        assert!(!SshRunner::new().keeps_sessions(), "off unless asked for");
     }
 
     #[test]

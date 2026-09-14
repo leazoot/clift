@@ -40,6 +40,14 @@
 //! The token is random rather than a fixed string on purpose. Standard output
 //! carries remote file names, and a name containing a newline could otherwise
 //! forge a frame marker -- the remote account is not a trusted source of text.
+//!
+//! # Not on Windows
+//!
+//! The Windows build of OpenSSH's `sftp` writes to a piped stdout only when it
+//! exits. Sent one command at a time with stdin left open, it answered each on
+//! stderr at once and printed nothing on stdout until stdin was closed. The
+//! echo this module frames on never arrives while such a session is alive, so
+//! `SshRunner::with_sessions` leaves sessions off there.
 
 use crate::proc::SftpBatch;
 use std::ffi::OsString;

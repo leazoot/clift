@@ -10,11 +10,12 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - On Windows, setting up a Fast Mode host stopped at "Asking … where home is"
-  and waited out two timeouts. Clift reads each reply from `sftp` up to a
-  marker line, and the Windows build of OpenSSH ends its lines with `\r\n`, so
-  the marker never matched. It now matches up to the end of the line, whatever
-  the line ending. A reply whose two halves arrived apart could also be lost
-  while Clift waited for the second one; that is fixed as well.
+  or "Creating a directory" and waited out long timeouts. To avoid starting a
+  new `sftp` for every step, Clift keeps one open and reads each answer as it
+  arrives, but the Windows build of OpenSSH holds that output until `sftp`
+  exits. On Windows each step now runs its own `sftp`. Replies are also read
+  correctly when their lines end in `\r\n`, and a reply whose two halves
+  arrived apart is no longer lost while Clift waits for the second one.
 - On Windows, setup then stopped with "did not report the permissions". The
   Windows `sftp` client prints group and other permissions as `*`, so from there
   `0700` and `0777` look the same. Clift now checks the owner's permissions it
