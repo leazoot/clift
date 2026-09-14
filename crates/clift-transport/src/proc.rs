@@ -46,6 +46,14 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// has no "wait with timeout", and a dependency for one is not worth it.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How long a kept session may sit quiet before [`SshRunner::tend_sessions`]
+/// checks that it is still alive.
+const QUIET_BEFORE_CHECK: Duration = Duration::from_secs(60);
+
+/// How long that check may take. Short, because a key press may be waiting
+/// behind it.
+const CHECK_LIMIT: Duration = Duration::from_secs(10);
+
 /// What an invocation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutcome {
@@ -79,7 +87,30 @@ pub struct SshRunner {
     /// Shared between clones for the same reason as `consulted`: a session is a
     /// property of this run against that host, not of whichever clone of the
     /// runner happens to be holding it.
-    sessions: Option<Arc<Mutex<HashMap<String, SftpSession>>>>,
+    sessions: Option<Arc<Mutex<HashMap<String, Kept>>>>,
+    /// How long a kept session may go unused before it is closed. `None` keeps
+    /// it for as long as the runner lives, which for a single command is the
+    /// command.
+    idle_limit: Option<Duration>,
+}
+
+/// A kept session, and when it was last put to work and last checked.
+#[derive(Debug)]
+struct Kept {
+    session: SftpSession,
+    last_used: Instant,
+    last_checked: Instant,
+}
+
+impl Kept {
+    fn new(session: SftpSession) -> Self {
+        let now = Instant::now();
+        Self {
+            session,
+            last_used: now,
+            last_checked: now,
+        }
+    }
 }
 
 impl Default for SshRunner {
@@ -99,6 +130,7 @@ impl SshRunner {
             reuse: None,
             consulted: Arc::new(Mutex::new(HashMap::new())),
             sessions: None,
+            idle_limit: None,
         }
     }
 
@@ -131,6 +163,56 @@ impl SshRunner {
     pub fn with_sessions(mut self) -> Self {
         self.sessions = Some(Arc::new(Mutex::new(HashMap::new())));
         self
+    }
+
+    /// Closes a kept session once it has gone unused for `limit`.
+    ///
+    /// For a process that lives between operations, such as the hotkey
+    /// helper: one connection serves every press made within the limit, and
+    /// none outlives it. It is the promise `ControlPersist` makes, kept by
+    /// Clift itself, so that it also holds where the client has no
+    /// `ControlPersist`.
+    #[must_use]
+    pub fn with_idle_limit(mut self, limit: Duration) -> Self {
+        self.idle_limit = Some(limit);
+        self
+    }
+
+    /// Closes kept sessions that have been idle past the limit, and checks
+    /// that the others are still alive.
+    ///
+    /// A connection that has sat quiet for a while can have been dropped by
+    /// something in between, a NAT or a proxy, without `ssh` noticing. The
+    /// first request on it would then wait out the whole timeout while the
+    /// user looks at an empty prompt. A cheap request every so often finds
+    /// that out ahead of time, and keeps such a middlebox from dropping the
+    /// connection in the first place. A session that fails the check is
+    /// closed, and the next operation opens a new one.
+    pub fn tend_sessions(&self) {
+        let Some(sessions) = &self.sessions else {
+            return;
+        };
+        let mut open = match sessions.lock() {
+            Ok(open) => open,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let idle_limit = self.idle_limit;
+        open.retain(|_, kept| {
+            if idle_limit.is_some_and(|limit| now.duration_since(kept.last_used) >= limit) {
+                return false;
+            }
+            if !kept.session.is_usable() {
+                return false;
+            }
+            if now.duration_since(kept.last_checked) < QUIET_BEFORE_CHECK {
+                return true;
+            }
+            kept.session.start_operation_within(CHECK_LIMIT);
+            let alive = kept.session.realpath(".").is_ok();
+            kept.last_checked = Instant::now();
+            alive
+        });
     }
 
     /// Whether this runner keeps SFTP sessions open. Exposed so a caller can
@@ -353,18 +435,22 @@ impl SshRunner {
             Err(poisoned) => poisoned.into_inner(),
         };
         let host = target.ssh_host().to_string();
-        let session = match open.entry(host.clone()) {
+        let idle_limit = self.idle_limit;
+        let kept = match open.entry(host.clone()) {
             Entry::Occupied(entry) => {
                 let existing = entry.into_mut();
-                if !existing.is_usable() {
-                    *existing = self.open_session(target)?;
+                let expired = idle_limit.is_some_and(|limit| existing.last_used.elapsed() >= limit);
+                if expired || !existing.session.is_usable() {
+                    *existing = Kept::new(self.open_session(target)?);
                 }
                 existing
             }
-            Entry::Vacant(entry) => entry.insert(self.open_session(target)?),
+            Entry::Vacant(entry) => entry.insert(Kept::new(self.open_session(target)?)),
         };
-        session.start_operation();
-        let outcome = action(session);
+        kept.session.start_operation();
+        let outcome = action(&mut kept.session);
+        kept.last_used = Instant::now();
+        kept.last_checked = kept.last_used;
         if matches!(outcome, Err(Failure::Broken { .. })) {
             open.remove(&host);
         }

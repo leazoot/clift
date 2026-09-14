@@ -30,6 +30,12 @@ use clift_core::error::{CliftError, ErrorKind, Remedy, Stage};
 use clift_core::hotkey::{self, Hotkey};
 use clift_core::ports::{ClipboardSnapshot, ClipboardSource};
 use clift_inject::{Availability, autostart};
+use clift_transport::probe::OpenSshTransport;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// How often the helper looks after the connection it keeps.
+const TEND_EVERY: Duration = Duration::from_secs(30);
 
 /// # Errors
 /// Fails when the combination is unreadable, when the operating system will not
@@ -114,6 +120,12 @@ fn listen(combination: &Hotkey, reporter: &Reporter) -> Result<(), CliftError> {
     // arrive. Where it has none, this is the plain check.
     announce(&clift_inject::request_permission(), reporter);
 
+    // One transport for the life of the helper, so that a Fast Mode press made
+    // soon after another finds its connection still open. Built by the first
+    // Fast Mode press and not before: nothing is dialled until the key is.
+    let kept: OnceLock<OpenSshTransport> = OnceLock::new();
+    let mut tending = false;
+
     let mut previous = clift_inject::availability();
     clift_inject::hotkey::listen(combination, &mut || {
         // Re-checked every press, so granting the permission takes effect
@@ -123,8 +135,25 @@ fn listen(combination: &Hotkey, reporter: &Reporter) -> Result<(), CliftError> {
             announce(&now, reporter);
             previous = now.clone();
         }
-        press(now.is_ready(), reporter);
+        press(now.is_ready(), &kept, reporter);
+        if !tending && let Some(transport) = kept.get() {
+            tending = true;
+            start_tending(transport.clone());
+        }
     })
+}
+
+/// Looks after the kept connection for as long as the helper runs: closes it
+/// once it has gone unused for `connection.persist`, and checks in between
+/// that it is still alive, so a press never waits on a connection that died
+/// while nobody was using it.
+fn start_tending(transport: OpenSshTransport) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(TEND_EVERY);
+            transport.tend_sessions();
+        }
+    });
 }
 
 /// One press, in whichever direction the clipboard calls for.
@@ -134,7 +163,7 @@ fn listen(combination: &Hotkey, reporter: &Reporter) -> Result<(), CliftError> {
 /// image to a second temporary file on every outward press, and the second read
 /// could disagree with the first if the user copied something in between --
 /// which would mean deciding on one clipboard and acting on another.
-fn press(can_inject: bool, reporter: &Reporter) {
+fn press(can_inject: bool, kept: &OnceLock<OpenSshTransport>, reporter: &Reporter) {
     // Held for the whole function: the adapter owns the temporary file behind
     // any image in the snapshot, and dropping it early would delete the file
     // the paste is about to read.
@@ -166,6 +195,7 @@ fn press(can_inject: bool, reporter: &Reporter) {
         !can_inject,
         can_inject,
         &AlreadyRead(snapshot),
+        Some(kept),
         reporter,
     );
     report(outcome, reporter);

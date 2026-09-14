@@ -29,7 +29,13 @@ use clift_core::config::{self, Config, Mode};
 use clift_core::error::{CliftError, ErrorKind, Remedy, Stage};
 use clift_core::ports::{ClipboardSource, TransportTarget};
 use clift_core::usecase::{self, Resolved, SendPolicy};
+use clift_transport::probe::OpenSshTransport;
+use std::sync::OnceLock;
 
+/// `kept` is where a process that pastes more than once keeps its transport, so
+/// that a Fast Mode press finds the connection the previous one left open. A
+/// single command passes `None` and builds one for itself.
+///
 /// # Errors
 /// Returns exit code 10 when the clipboard holds nothing to upload, which the
 /// terminal turns into an ordinary paste. Every other failure leaves stdout
@@ -40,6 +46,7 @@ pub fn run(
     copy: bool,
     inject: bool,
     source: &dyn ClipboardSource,
+    kept: Option<&OnceLock<OpenSshTransport>>,
     reporter: &Reporter,
 ) -> Result<(), CliftError> {
     // Argument validation first, and before the clipboard is touched. A
@@ -104,6 +111,7 @@ pub fn run(
             &resolved,
             to,
             delivery(copy, inject),
+            kept,
             reporter,
         ),
     }
@@ -184,23 +192,32 @@ fn fast(
     resolved: &Resolved,
     to: Option<&str>,
     delivery: Delivery,
+    kept: Option<&OnceLock<OpenSshTransport>>,
     reporter: &Reporter,
 ) -> Result<(), CliftError> {
     let (name, target) = usecase::resolve_send_target(config, to)?;
 
-    let transport = crate::system::transport(config, reporter);
+    let built;
+    let transport = match kept {
+        Some(cell) => cell.get_or_init(|| crate::system::transport(config, reporter)),
+        None => {
+            built = crate::system::transport(config, reporter);
+            &built
+        }
+    };
     // Nine or ten SSH operations, sharing one connection where reuse is
     // available. Long enough either way to need saying.
     let spinner = Spinner::new(reporter.interactive());
-    let narrating = Narrating::new(&transport, &spinner);
+    let narrating = Narrating::new(transport, &spinner).timed(reporter);
+    let host = TransportTarget::new(target.ssh_host());
     let outcome = usecase::perform(
         &narrating,
-        &TransportTarget::new(target.ssh_host()),
+        &host,
         resolved.attachments(),
         &SendPolicy {
             limits: config.defaults().limits(),
             remote_dir: Some(target.remote_dir()),
-            retention: Some(config.defaults().retention()),
+            remote_home: target.remote_home(),
         },
         &SystemClock,
         &SystemIdSource,
@@ -212,9 +229,20 @@ fn fast(
     if let Some(warning) = outcome.inbox_warning() {
         reporter.warn(warning);
     }
-    if let Some(note) = outcome.sweep_note() {
-        reporter.verbose(note);
-    }
+
+    // The occasional tidy-up runs once the result is out, whichever way it
+    // goes out: it must not stand between a key press and the text it types.
+    let tidy = || {
+        if let Some(note) = usecase::tidy_after(
+            &outcome,
+            transport,
+            &host,
+            Some(config.defaults().retention()),
+            &SystemClock,
+        ) {
+            reporter.verbose(&note);
+        }
+    };
 
     if reporter.json() {
         let document = dto::send(
@@ -224,7 +252,9 @@ fn fast(
         );
         let value =
             serde_json::to_value(&document).map_err(|error| serialisation_failed(&error))?;
-        return reporter.machine(&value).map_err(stdout_failed);
+        reporter.machine(&value).map_err(stdout_failed)?;
+        tidy();
+        return Ok(());
     }
 
     // Only now, after the upload succeeded: replacing the clipboard or typing
@@ -237,6 +267,7 @@ fn fast(
     // file: on a machine that could type, a press in Fast Mode did nothing
     // anybody could see.
     universal::deliver(delivery, outcome.insertion_text())?;
+    tidy();
 
     match delivery {
         Delivery::Copy => {

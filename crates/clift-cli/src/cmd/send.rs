@@ -78,15 +78,16 @@ pub fn run(
     // difference between those two is the difference between a wait and a
     // wait long enough to look like a hang.
     let spinner = Spinner::new(reporter.interactive());
-    let narrating = Narrating::new(&transport, &spinner);
+    let narrating = Narrating::new(&transport, &spinner).timed(reporter);
+    let host = TransportTarget::new(target.ssh_host());
     let outcome = usecase::perform(
         &narrating,
-        &TransportTarget::new(target.ssh_host()),
+        &host,
         resolved.attachments(),
         &usecase::SendPolicy {
             limits: loaded.config.defaults().limits(),
             remote_dir: Some(target.remote_dir()),
-            retention: Some(loaded.config.defaults().retention()),
+            remote_home: target.remote_home(),
         },
         &SystemClock,
         &SystemIdSource,
@@ -98,12 +99,20 @@ pub fn run(
     if let Some(warning) = outcome.inbox_warning() {
         reporter.warn(warning);
     }
-    if let Some(note) = outcome.sweep_note() {
-        // The occasional tidy-up, which never changes the outcome of the send.
-        reporter.verbose(note);
-    }
 
-    render(&outcome, name.as_str(), copy, reporter)
+    render(&outcome, name.as_str(), copy, reporter)?;
+    // The occasional tidy-up, after the result is out: it never changes the
+    // outcome of the send, and must not delay it either.
+    if let Some(note) = usecase::tidy_after(
+        &outcome,
+        &transport,
+        &host,
+        Some(loaded.config.defaults().retention()),
+        &SystemClock,
+    ) {
+        reporter.verbose(&note);
+    }
+    Ok(())
 }
 
 /// Turns "nothing to send" into a message that says what to do about it.

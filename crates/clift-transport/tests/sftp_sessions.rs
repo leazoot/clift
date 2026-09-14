@@ -57,6 +57,14 @@ fn authentications(fixture: &SshdFixture) -> usize {
         .count()
 }
 
+/// How many sessions the server has closed.
+fn closed_sessions(fixture: &SshdFixture) -> usize {
+    server_log(fixture)
+        .lines()
+        .filter(|line| line.contains("Close session"))
+        .count()
+}
+
 /// Sends a signal to every `sftp-server` in the container.
 ///
 /// This is how a server that stops answering is produced for real: the
@@ -305,4 +313,67 @@ fn a_kept_session_returns_what_a_fresh_one_would_have() {
     );
 
     fresh.remove(&target, &directory).unwrap();
+}
+
+/// Operations made within the idle limit share the session the first one
+/// opened, which is what makes a second key press quick.
+#[test]
+fn operations_within_the_idle_limit_share_one_session() {
+    if skip_without_docker("operations_within_the_idle_limit_share_one_session") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions()
+            .with_idle_limit(Duration::from_secs(30)),
+    );
+    let before = sftp_sessions(&fixture);
+    transport.resolve_home(&target).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    transport.tend_sessions();
+    transport.resolve_home(&target).unwrap();
+    assert_eq!(sftp_sessions(&fixture) - before, 1);
+}
+
+/// A kept session that goes unused past its limit is closed rather than kept
+/// for the life of the process, and the next operation opens a fresh one.
+#[test]
+fn a_kept_session_is_closed_once_it_has_been_idle_past_its_limit() {
+    if skip_without_docker("a_kept_session_is_closed_once_it_has_been_idle_past_its_limit") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions()
+            .with_idle_limit(Duration::from_secs(1)),
+    );
+    transport.resolve_home(&target).unwrap();
+    let opened = sftp_sessions(&fixture);
+    let closed = closed_sessions(&fixture);
+
+    std::thread::sleep(Duration::from_millis(1_500));
+    transport.tend_sessions();
+    // The server logs the close once the client has gone, which takes a
+    // moment after the process is stopped.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while closed_sessions(&fixture) == closed && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        closed_sessions(&fixture) > closed,
+        "the idle session was left open"
+    );
+
+    transport.resolve_home(&target).unwrap();
+    assert_eq!(
+        sftp_sessions(&fixture) - opened,
+        1,
+        "the next operation opens a fresh session"
+    );
 }

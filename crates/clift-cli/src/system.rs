@@ -44,7 +44,9 @@ pub fn transport(config: &Config, reporter: &Reporter) -> OpenSshTransport {
     // Both hang off the same `reuse` setting because both are what that setting
     // says: one connection per host rather than one per operation. Turning it
     // off gets the behaviour Clift had before either existed.
-    let runner = SshRunner::new().with_sessions();
+    let runner = SshRunner::new()
+        .with_sessions()
+        .with_idle_limit(connection.persist());
     match Reuse::in_private_dir(connection.persist()) {
         Ok(reuse) => {
             reporter.verbose(&format!(

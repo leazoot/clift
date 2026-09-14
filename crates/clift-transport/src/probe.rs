@@ -41,6 +41,12 @@ impl OpenSshTransport {
         &self.runner
     }
 
+    /// Looks after the sessions this transport keeps; see
+    /// [`SshRunner::tend_sessions`].
+    pub fn tend_sessions(&self) {
+        self.runner.tend_sessions();
+    }
+
     /// Checks that the host is reachable, authenticated and speaks SFTP.
     ///
     /// This is the body of [`clift_core::ports::Transport::probe`]; the trait

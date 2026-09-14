@@ -14,7 +14,7 @@ mod uninstall;
 
 pub use fetch::{Fetched, fetch};
 pub use publish::{Published, PublishedEntry, publish};
-pub use send::{SendOutcome, SendPolicy, perform, stage_attachments};
+pub use send::{SendOutcome, SendPolicy, perform, stage_attachments, tidy_after};
 pub use setup::{SetupReport, SetupStep, prepare_target};
 pub use source::{Origin, Resolved, resolve};
 pub use target::{

@@ -11,8 +11,8 @@ use crate::error::{CliftError, ErrorKind, Remedy, Stage};
 use crate::format::render;
 use crate::ports::{Clock, IdSource, RemoteFs, RemoteUpload, TransportTarget};
 use crate::staging::{
-    Action, BatchPlan, InboxLocation, Retention, StagedBatch, clean, create_batch, ensure_inbox,
-    plan_batch, stage_batch,
+    Action, BatchPlan, InboxLocation, Retention, StagedBatch, clean, create_batch,
+    ensure_inbox_from, plan_batch, stage_batch,
 };
 use std::time::Duration;
 
@@ -55,7 +55,8 @@ pub struct SendOutcome {
     batch: StagedBatch,
     insertion_text: String,
     inbox_warning: Option<String>,
-    sweep: Option<String>,
+    batch_id: String,
+    inbox_root: RemotePath,
 }
 
 impl SendOutcome {
@@ -76,13 +77,6 @@ impl SendOutcome {
     pub fn inbox_warning(&self) -> Option<&str> {
         self.inbox_warning.as_deref()
     }
-
-    /// What the occasional cleanup had to say, if it ran and had anything to
-    /// say. Never affects the outcome of the send.
-    #[must_use]
-    pub fn sweep_note(&self) -> Option<&str> {
-        self.sweep.as_deref()
-    }
 }
 
 /// What the configuration says about one send.
@@ -95,9 +89,9 @@ pub struct SendPolicy<'a> {
     pub limits: Limits,
     /// Where the user asked for the inbox to be, if they asked.
     pub remote_dir: Option<&'a str>,
-    /// How long batches are kept, which is also what the occasional sweep
-    /// removes by. `None` disables the sweep entirely.
-    pub retention: Option<Duration>,
+    /// The remote home `setup` recorded, if it recorded one. With it the send
+    /// does not ask the host again.
+    pub remote_home: Option<&'a RemotePath>,
 }
 
 /// Sends one batch of attachments, from limits to insertion text.
@@ -130,7 +124,7 @@ where
     let SendPolicy {
         limits,
         remote_dir,
-        retention,
+        remote_home,
     } = *policy;
     // Before the first round trip, not merely before the first byte: an
     // oversized batch should not even open a connection.
@@ -143,7 +137,7 @@ where
             ))
     })?;
 
-    let inbox: InboxLocation = ensure_inbox(transport, target, remote_dir)?;
+    let inbox: InboxLocation = ensure_inbox_from(transport, target, remote_home, remote_dir)?;
     let plan = plan_batch(&inbox, clock, ids)?;
     let batch = stage_attachments(transport, target, &plan, limits, attachments)?;
 
@@ -153,22 +147,41 @@ where
         .map(|file| file.path().clone())
         .collect();
 
-    // Everything above has succeeded. Nothing below is allowed to change that.
-    let sweep = sweep_after(
-        plan.id().as_str(),
-        retention,
-        transport,
-        target,
-        inbox.root(),
-        clock,
-    );
-
     Ok(SendOutcome {
         insertion_text: render(&paths),
         inbox_warning: inbox.warning(),
-        sweep,
+        batch_id: plan.id().as_str().to_string(),
+        inbox_root: inbox.root().clone(),
         batch,
     })
+}
+
+/// The occasional tidy-up of expired batches, for after a send has been
+/// delivered.
+///
+/// Not part of [`perform`] so that it cannot stand between a key press and the
+/// text it produces: a sweep lists directories, and on a distant host that is
+/// seconds the user would spend looking at an empty prompt. Whatever it finds
+/// or fails to do is a note, never a change to the send it follows.
+#[must_use]
+pub fn tidy_after<T>(
+    outcome: &SendOutcome,
+    transport: &T,
+    target: &TransportTarget,
+    retention: Option<Duration>,
+    clock: &dyn Clock,
+) -> Option<String>
+where
+    T: RemoteFs,
+{
+    sweep_after(
+        &outcome.batch_id,
+        retention,
+        transport,
+        target,
+        &outcome.inbox_root,
+        clock,
+    )
 }
 
 /// One send in [`SWEEP_ONE_IN`] also tidies up expired batches.
@@ -205,7 +218,7 @@ fn sweep_after<T>(
     clock: &dyn Clock,
 ) -> Option<String>
 where
-    T: RemoteFs + RemoteUpload,
+    T: RemoteFs,
 {
     let retention = retention?;
     if !should_sweep(batch_id) {
@@ -450,39 +463,55 @@ mod tests {
         assert!(!should_sweep("zz"));
     }
 
+    /// The send itself lists nothing: the tidy-up comes after the text has
+    /// been delivered, so it can never stand between a key press and a path.
+    #[test]
+    fn a_send_itself_never_tidies_up() {
+        let transport = RecordingTransport::new("/home/dev");
+        transport.fail_list_dir("a send must not list anything");
+        // The fake identifiers begin with a zero byte, which is on the sweeping
+        // side of the line: were the sweep still inside the send, it would run.
+        let outcome = perform(
+            &transport,
+            &TransportTarget::new("core"),
+            &[attachment("a.png", 1)],
+            &SendPolicy::default(),
+            &FakeClock::at_unix_seconds(1_788_093_240),
+            &FakeIdSource::starting_at(1),
+        )
+        .expect("a send that lists nothing cannot fail on a listing");
+        assert!(outcome.insertion_text().starts_with("Please inspect"));
+    }
+
     /// The attachments are already there. A failed tidy-up is a note,
     /// not an outcome.
     #[test]
-    fn a_failing_sweep_does_not_fail_the_send() {
+    fn a_failing_tidy_up_is_only_a_note() {
         let transport = RecordingTransport::new("/home/dev");
-        transport.fail_list_dir("the inbox could not be listed");
         let target = TransportTarget::new("core");
         let clock = FakeClock::at_unix_seconds(1_788_093_240);
-        // The fake identifiers begin with a zero byte, which is on the sweeping
-        // side of the line -- so this send does try to tidy up, and fails.
-        let ids = FakeIdSource::starting_at(1);
-
         let outcome = perform(
             &transport,
             &target,
             &[attachment("a.png", 1)],
-            &SendPolicy {
-                retention: Some(Duration::from_secs(60)),
-                ..SendPolicy::default()
-            },
+            &SendPolicy::default(),
             &clock,
-            &ids,
+            &FakeIdSource::starting_at(1),
         )
-        .expect("a failed sweep must not fail the send");
+        .unwrap();
 
-        assert_eq!(outcome.batch().files().len(), 1);
-        assert!(outcome.insertion_text().starts_with("Please inspect"));
+        transport.fail_list_dir("the inbox could not be listed");
+        let note = tidy_after(
+            &outcome,
+            &transport,
+            &target,
+            Some(Duration::from_secs(60)),
+            &clock,
+        );
         assert!(
-            outcome
-                .sweep_note()
+            note.as_deref()
                 .is_some_and(|note| note.contains("could not tidy up")),
-            "the failure is reported as a note: {:?}",
-            outcome.sweep_note()
+            "the failure is reported as a note: {note:?}"
         );
     }
 
@@ -490,17 +519,54 @@ mod tests {
     #[test]
     fn no_retention_means_no_sweep() {
         let transport = RecordingTransport::new("/home/dev");
+        let target = TransportTarget::new("core");
+        let clock = FakeClock::at_unix_seconds(0);
+        let outcome = perform(
+            &transport,
+            &target,
+            &[attachment("a.png", 1)],
+            &SendPolicy::default(),
+            &clock,
+            &FakeIdSource::starting_at(1),
+        )
+        .unwrap();
         transport.fail_list_dir("this must never be reached");
+        assert_eq!(
+            tidy_after(&outcome, &transport, &target, None, &clock),
+            None
+        );
+    }
+
+    /// A home `setup` already recorded is used as it is, not asked for again.
+    #[test]
+    fn a_recorded_home_is_not_asked_for_again() {
+        let transport = RecordingTransport::new("/home/dev");
+        let home = crate::domain::RemotePath::new("/home/dev").unwrap();
         let outcome = perform(
             &transport,
             &TransportTarget::new("core"),
             &[attachment("a.png", 1)],
-            &SendPolicy::default(),
-            &FakeClock::at_unix_seconds(0),
+            &SendPolicy {
+                remote_home: Some(&home),
+                ..SendPolicy::default()
+            },
+            &FakeClock::at_unix_seconds(1_788_093_240),
             &FakeIdSource::starting_at(1),
         )
         .unwrap();
-        assert_eq!(outcome.sweep_note(), None);
+        assert!(
+            outcome
+                .insertion_text()
+                .contains("/home/dev/.cache/clift/inbox/")
+        );
+        assert!(
+            !transport
+                .calls()
+                .iter()
+                .any(|call| matches!(call, crate::testing::TransportCall::ResolveHome { .. })),
+            "the home was asked for again: {:?}",
+            transport.calls()
+        );
     }
 
     /// Raising the ceiling in configuration must raise it here, or the setting

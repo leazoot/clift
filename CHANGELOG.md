@@ -16,6 +16,16 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is now one connection and one SFTP session on every platform, including
   clients that cannot reuse connections, and the `sftp` program is no longer
   needed. `doctor` drops its "sftp client" check and reports twelve.
+- The hotkey helper keeps its SSH connection open between presses, for up to
+  `connection.persist` (ten minutes unless configured), and checks now and
+  then that it is still alive. The first Fast Mode press after a quiet spell
+  connects as before; the presses after it skip the connection entirely. On a
+  client that cannot reuse connections, Windows among them, that is most of
+  the wait.
+- A Fast Mode send no longer asks the host for its home directory when `setup`
+  already recorded it, and the occasional tidy-up of expired batches runs after
+  the text has been typed or printed rather than before.
+- `--verbose` on `send` and `paste` says how long each remote operation took.
 
 ### Fixed
 

@@ -109,6 +109,7 @@ fn run(cli: &Cli, reporter: &Reporter) -> Result<(), CliftError> {
             *copy,
             *inject,
             &clift_clipboard::SystemClipboard::new(),
+            None,
             reporter,
         ),
         Command::Fetch {

@@ -140,6 +140,15 @@ pub fn locate_inbox(
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
     let home = remote.resolve_home(target)?;
+    locate_from(remote, target, home, configured)
+}
+
+fn locate_from(
+    remote: &dyn RemoteFs,
+    target: &TransportTarget,
+    home: RemotePath,
+    configured: Option<&str>,
+) -> Result<InboxLocation, CliftError> {
     // Only asked for when it can still change the answer. A configured
     // location wins outright, and the round trip that asks the host about its
     // cache directory costs seconds on a real connection.
@@ -162,7 +171,29 @@ pub fn ensure_inbox(
     target: &TransportTarget,
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
-    let location = locate_inbox(remote, target, configured)?;
+    ensure_inbox_from(remote, target, None, configured)
+}
+
+/// [`ensure_inbox`], starting from a home directory that is already known.
+///
+/// `setup` records the remote home with the target, and a send that starts
+/// from it does not spend a round trip asking again: on a distant host that
+/// round trip is a noticeable part of a key press. A home that has moved since
+/// `setup` shows up as the inbox failing to be created there, which running
+/// `setup` again repairs. With no known home this is exactly [`ensure_inbox`].
+///
+/// # Errors
+/// As [`ensure_inbox`].
+pub fn ensure_inbox_from(
+    remote: &dyn RemoteFs,
+    target: &TransportTarget,
+    known_home: Option<&RemotePath>,
+    configured: Option<&str>,
+) -> Result<InboxLocation, CliftError> {
+    let location = match known_home {
+        Some(home) => locate_from(remote, target, home.clone(), configured)?,
+        None => locate_inbox(remote, target, configured)?,
+    };
     remote.ensure_dir(target, location.root(), INBOX_MODE)?;
     Ok(location)
 }

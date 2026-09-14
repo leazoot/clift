@@ -91,10 +91,7 @@ fn a_sweep_running_during_a_send_does_not_take_the_batch_being_written() {
 
     // A send large enough to still be running when the sweep starts.
     let payload = attachment(&fixture, "large.bin", 8 * 1024 * 1024);
-    let policy = SendPolicy {
-        retention: Some(Duration::from_secs(24 * 60 * 60)),
-        ..SendPolicy::default()
-    };
+    let policy = SendPolicy::default();
 
     let (outcome, report) = std::thread::scope(|scope| {
         let sending = scope.spawn(|| {

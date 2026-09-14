@@ -170,7 +170,13 @@ impl SftpSession {
     /// whole `sftp` process, rather than each reply: a transfer that keeps
     /// making progress but will not finish in time is stopped just the same.
     pub fn start_operation(&mut self) {
-        self.deadline = Instant::now() + self.timeout;
+        self.start_operation_within(self.timeout);
+    }
+
+    /// Starts the clock for one operation with a limit of its own, for a
+    /// request that must not keep anyone waiting as long as a transfer may.
+    pub fn start_operation_within(&mut self, limit: Duration) {
+        self.deadline = Instant::now() + limit;
     }
 
     /// Whether the session can still be used: nothing has gone wrong on it,

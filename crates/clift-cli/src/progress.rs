@@ -20,6 +20,7 @@
 //! of what `setup` is expected to do. A step that hangs therefore names the
 //! thing that is hanging.
 
+use crate::output::Reporter;
 use clift_core::domain::RemotePath;
 use clift_core::error::CliftError;
 use clift_core::ports::{ProbeReport, RemoteEntry, RemoteFs, RemoteUpload, TransportTarget};
@@ -208,17 +209,38 @@ fn lock(mutex: &Mutex<State>) -> MutexGuard<'_, State> {
 pub struct Narrating<'a, T> {
     inner: &'a T,
     spinner: &'a Spinner,
+    timings: Option<&'a Reporter>,
 }
 
 impl<'a, T> Narrating<'a, T> {
     pub const fn new(inner: &'a T, spinner: &'a Spinner) -> Self {
-        Self { inner, spinner }
+        Self {
+            inner,
+            spinner,
+            timings: None,
+        }
+    }
+
+    /// Also says how long each operation took, under `--verbose`.
+    ///
+    /// For the commands whose latency a person feels on every press: where a
+    /// send spends its seconds is otherwise a guess, and a guess is what the
+    /// last two attempts to explain it were.
+    #[must_use]
+    pub const fn timed(mut self, reporter: &'a Reporter) -> Self {
+        self.timings = Some(reporter);
+        self
     }
 
     fn narrate<R>(&self, label: String, action: impl FnOnce(&T) -> R) -> R {
+        let started = Instant::now();
+        let reported = self.timings.map(|_| label.clone());
         self.spinner.begin(label);
         let outcome = action(self.inner);
         self.spinner.end();
+        if let (Some(reporter), Some(label)) = (self.timings, reported) {
+            reporter.verbose(&format!("{label}: {} ms", started.elapsed().as_millis()));
+        }
         outcome
     }
 }
