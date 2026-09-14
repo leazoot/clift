@@ -18,10 +18,11 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   needed. `doctor` drops its "sftp client" check and reports twelve.
 - The hotkey helper keeps its SSH connection open between presses, for up to
   `connection.persist` (ten minutes unless configured), and checks now and
-  then that it is still alive. The first Fast Mode press after a quiet spell
-  connects as before; the presses after it skip the connection entirely. On a
-  client that cannot reuse connections, Windows among them, that is most of
-  the wait.
+  then that it is still alive. It also remembers, for as long, where the host
+  keeps its caches. The first Fast Mode press after a quiet spell connects and
+  asks as before; the presses after it do neither. On a client that cannot
+  reuse connections, Windows among them, each of those was a login of its own
+  and together they were most of the wait.
 - A Fast Mode send no longer asks the host for its home directory when `setup`
   already recorded it, and the occasional tidy-up of expired batches runs after
   the text has been typed or printed rather than before.

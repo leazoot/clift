@@ -23,6 +23,7 @@
 use crate::errmap::{map_failure, map_refusal};
 use crate::reuse::Reuse;
 use crate::session::{Failure, SftpSession};
+use clift_core::domain::RemotePath;
 use clift_core::error::{CliftError, ErrorKind, Remedy, Stage};
 use clift_core::ports::TransportTarget;
 use std::collections::HashMap;
@@ -92,6 +93,16 @@ pub struct SshRunner {
     /// it for as long as the runner lives, which for a single command is the
     /// command.
     idle_limit: Option<Duration>,
+    /// Per host: what it said about its cache directory. Only consulted while
+    /// sessions are kept; see [`Self::remembered_cache_home`].
+    cache_homes: Arc<Mutex<HashMap<String, Remembered>>>,
+}
+
+/// A host's answer about its cache directory, and when it was last relied on.
+#[derive(Debug)]
+struct Remembered {
+    cache_home: Option<RemotePath>,
+    last_used: Instant,
 }
 
 /// A kept session, and when it was last put to work and last checked.
@@ -131,6 +142,7 @@ impl SshRunner {
             consulted: Arc::new(Mutex::new(HashMap::new())),
             sessions: None,
             idle_limit: None,
+            cache_homes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -213,6 +225,55 @@ impl SshRunner {
             kept.last_checked = Instant::now();
             alive
         });
+    }
+
+    /// What the host said about its cache directory, if it was asked recently
+    /// enough to rely on. `None` means ask.
+    ///
+    /// The question is an `ssh` command of its own, not an SFTP request, so a
+    /// kept session does not make it cheaper: on a client that cannot reuse
+    /// connections it is a whole login on every key press. A runner that keeps
+    /// sessions keeps the answer on the same terms, until it has gone unused
+    /// for the idle limit. Nothing is written anywhere; the answer ends with
+    /// the process at the latest.
+    pub(crate) fn remembered_cache_home(
+        &self,
+        target: &TransportTarget,
+    ) -> Option<Option<RemotePath>> {
+        self.sessions.as_ref()?;
+        let host = target.ssh_host();
+        let mut remembered = self.cache_homes.lock().ok()?;
+        let entry = remembered.get_mut(host)?;
+        if self
+            .idle_limit
+            .is_some_and(|limit| entry.last_used.elapsed() >= limit)
+        {
+            remembered.remove(host);
+            return None;
+        }
+        entry.last_used = Instant::now();
+        Some(entry.cache_home.clone())
+    }
+
+    /// Records the host's answer for [`Self::remembered_cache_home`], when
+    /// this runner keeps sessions.
+    pub(crate) fn remember_cache_home(
+        &self,
+        target: &TransportTarget,
+        cache_home: Option<RemotePath>,
+    ) {
+        if self.sessions.is_none() {
+            return;
+        }
+        if let Ok(mut remembered) = self.cache_homes.lock() {
+            remembered.insert(
+                target.ssh_host().to_string(),
+                Remembered {
+                    cache_home,
+                    last_used: Instant::now(),
+                },
+            );
+        }
     }
 
     /// Whether this runner keeps SFTP sessions open. Exposed so a caller can

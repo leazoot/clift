@@ -73,7 +73,8 @@ impl OpenSshTransport {
     /// Read with a fixed literal command, which is why it may go through the
     /// login shell at all: there is no user input to interpolate. An unset
     /// variable makes `printenv` exit non-zero, which is a normal answer here
-    /// rather than a failure.
+    /// rather than a failure. A runner that keeps sessions answers a repeat of
+    /// the question itself; see `SshRunner::remembered_cache_home`.
     ///
     /// # Errors
     /// Fails when the host cannot be reached.
@@ -81,6 +82,15 @@ impl OpenSshTransport {
         &self,
         target: &TransportTarget,
     ) -> Result<Option<RemotePath>, CliftError> {
+        if let Some(known) = self.runner().remembered_cache_home(target) {
+            return Ok(known);
+        }
+        let answer = self.ask_cache_home(target)?;
+        self.runner().remember_cache_home(target, answer.clone());
+        Ok(answer)
+    }
+
+    fn ask_cache_home(&self, target: &TransportTarget) -> Result<Option<RemotePath>, CliftError> {
         let outcome = self.runner().run_ssh(target, "printenv XDG_CACHE_HOME")?;
         if !outcome.succeeded() {
             // `printenv` exits 1 for an unset variable and prints nothing. Any

@@ -338,6 +338,47 @@ fn operations_within_the_idle_limit_share_one_session() {
     assert_eq!(sftp_sessions(&fixture) - before, 1);
 }
 
+/// The host is asked for its cache directory once, not on every key press.
+///
+/// The question is an `ssh` command of its own rather than an SFTP request, so
+/// a kept session does nothing for it: without connection reuse, Windows among
+/// such clients, every asking is a login. Counted in sshd's log.
+#[test]
+fn the_cache_directory_is_asked_for_once_within_the_idle_limit() {
+    if skip_without_docker("the_cache_directory_is_asked_for_once_within_the_idle_limit") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions()
+            .with_idle_limit(Duration::from_secs(3)),
+    );
+    let logins = authentications(&fixture);
+
+    let first = transport.resolve_cache_home(&target).unwrap();
+    transport.resolve_home(&target).unwrap();
+    let second = transport.resolve_cache_home(&target).unwrap();
+    transport.resolve_home(&target).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        authentications(&fixture) - logins,
+        2,
+        "two presses cost more than the question and the session"
+    );
+
+    std::thread::sleep(Duration::from_millis(3_500));
+    transport.tend_sessions();
+    transport.resolve_cache_home(&target).unwrap();
+    assert_eq!(
+        authentications(&fixture) - logins,
+        3,
+        "an answer unused for the idle limit must be asked for again"
+    );
+}
+
 /// A kept session that goes unused past its limit is closed rather than kept
 /// for the life of the process, and the next operation opens a fresh one.
 #[test]
