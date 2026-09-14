@@ -16,7 +16,7 @@ use crate::ports::{
     CheckStatus, ClipboardSource, Randomness, Relay, RemoteFs, RemoteUpload, SshConfigSource,
     TransportTarget,
 };
-use crate::staging::{ensure_inbox, verify_round_trip};
+use crate::staging::{InboxLocation, ensure_inbox, partly_checked_permissions, verify_round_trip};
 use crate::universal::RelaySettings;
 use crate::universal::crypto::{self, NONCE_BYTES};
 use crate::universal::token::{SEAL_KEY_BYTES, SealKey};
@@ -540,12 +540,7 @@ fn remote_checks(environment: &Environment<'_>, target: &TransportTarget) -> Vec
                 CheckName::RemoteHome,
                 location.home().as_str().to_string(),
             ));
-            let mut detail = format!("{} is private (0700)", location.root());
-            if let Some(warning) = location.warning() {
-                detail.push_str("; ");
-                detail.push_str(&warning);
-            }
-            checks.push(pass(CheckName::InboxPermissions, detail));
+            checks.push(inbox_permissions(environment.remote, target, &location));
 
             match verify_round_trip(
                 environment.remote,
@@ -567,6 +562,48 @@ fn remote_checks(environment: &Environment<'_>, target: &TransportTarget) -> Vec
     }
 
     checks
+}
+
+/// The inbox check, which can vouch only for what this computer's sftp client
+/// shows. The Windows build of OpenSSH's sftp shows the owner's permission bits
+/// and hides the rest, and a check that passed on half the bits must not read
+/// as if it had seen all of them.
+fn inbox_permissions(
+    remote: &dyn RemoteFs,
+    target: &TransportTarget,
+    location: &InboxLocation,
+) -> DoctorCheck {
+    let host = target.ssh_host().to_string();
+    let root = location.root();
+    let (status, mut detail, remedy) = match partly_checked_permissions(remote, target, root) {
+        Ok(None) => (CheckStatus::Pass, format!("{root} is private (0700)"), None),
+        Ok(Some(partly)) => (
+            CheckStatus::Warn,
+            format!("the owner's part of {root} is private (0700); {partly}"),
+            Some(Remedy::new(
+                "See all of its permissions on the host:",
+                format!("ssh {host} ls -ld '{root}'"),
+            )),
+        ),
+        Err(error) => {
+            let remedy = error.remedy().cloned().unwrap_or_else(|| ssh_remedy(&host));
+            return fail(
+                CheckName::InboxPermissions,
+                error.message().to_string(),
+                remedy,
+            );
+        }
+    };
+    if let Some(warning) = location.warning() {
+        detail.push_str("; ");
+        detail.push_str(&warning);
+    }
+    DoctorCheck {
+        name: CheckName::InboxPermissions,
+        status,
+        detail,
+        remedy,
+    }
 }
 
 /// `ssh -G` resolving the alias, which is a different failure from the host

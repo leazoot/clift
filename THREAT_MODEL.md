@@ -124,7 +124,14 @@ above:
    reachable case, and the directory is empty then. Closing it would mean
    linking an SSH library or running a remote shell command, both of which
    this document refuses above.
-6. **Bytes a server sends back.** `clift copy` on a remote machine and `clift
+6. **Group and other permissions, seen from Windows.** The Windows build of
+   OpenSSH's `sftp` client prints only the owner's permission bits and shows
+   group and other as `*`, so from a Windows computer `0700` and `0777` look the
+   same. Clift sets `0700` on every directory it creates and refuses a directory
+   whose owner bits are wrong, but an inbox that already existed with group or
+   other access cannot be caught from there. `setup` and `doctor` say so, with a
+   command that shows the full permissions on the host.
+7. **Bytes a server sends back.** `clift copy` on a remote machine and `clift
    fetch --copy` at home reverse the direction, and the picture that reaches
    the local clipboard came from the far end. The relay cannot substitute it:
    altering one byte of the ciphertext makes the whole object fail to

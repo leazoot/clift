@@ -219,19 +219,15 @@ impl SftpSession {
             )));
         }
 
-        let echo = format!("sftp> -{}\n", self.fence);
         let deadline = Instant::now() + timeout;
         loop {
             self.pending_out.extend_from_slice(&self.stdout.take());
             self.pending_err.extend_from_slice(&self.stderr.take());
 
-            if let Some(out) = cut(&mut self.pending_out, echo.as_bytes())
-                && let Some(err) = cut_line(&mut self.pending_err, INVALID_COMMAND)
+            if let Some(frame) =
+                cut_frame(&mut self.pending_out, &mut self.pending_err, &self.fence)
             {
-                return Ok(Frame {
-                    stdout: String::from_utf8_lossy(&out).into_owned(),
-                    stderr: String::from_utf8_lossy(&err).into_owned(),
-                });
+                return Ok(frame);
             }
 
             if let Ok(Some(status)) = self.child.try_wait() {
@@ -285,14 +281,30 @@ struct Frame {
 /// the fence costs no round trip and cannot be influenced by the remote host.
 const INVALID_COMMAND: &[u8] = b"Invalid command.";
 
-/// Splits `buffer` at `marker`, returning what came before it and leaving what
-/// came after. `None` while the marker has not arrived yet.
-fn cut(buffer: &mut Vec<u8>, marker: &[u8]) -> Option<Vec<u8>> {
-    let at = find(buffer, marker)?;
-    let rest = buffer.split_off(at + marker.len());
-    let mut content = std::mem::replace(buffer, rest);
-    content.truncate(at);
-    Some(content)
+/// Takes one command's output off the front of both streams, once the fence
+/// has come back on each.
+///
+/// `None` while either half is incomplete, and then neither stream is touched:
+/// the pipes are drained separately, so one half routinely arrives first.
+/// Both markers are matched up to the end of their line rather than including
+/// a line ending, because the Windows build of OpenSSH's sftp ends its lines
+/// with `\r\n`.
+fn cut_frame(stdout: &mut Vec<u8>, stderr: &mut Vec<u8>, fence: &str) -> Option<Frame> {
+    let echo = format!("sftp> -{fence}");
+    if !has_line(stdout, echo.as_bytes()) || !has_line(stderr, INVALID_COMMAND) {
+        return None;
+    }
+    let out = cut_line(stdout, echo.as_bytes())?;
+    let err = cut_line(stderr, INVALID_COMMAND)?;
+    Some(Frame {
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+    })
+}
+
+/// Whether `marker` and the end of the line it sits on have both arrived.
+fn has_line(buffer: &[u8], marker: &[u8]) -> bool {
+    find(buffer, marker).is_some_and(|at| buffer[at..].contains(&b'\n'))
 }
 
 /// As [`cut`], but consumes the whole line the marker sits on.
@@ -382,32 +394,34 @@ mod tests {
 
     #[test]
     fn a_frame_ends_at_the_marker_and_leaves_the_rest() {
-        let mut buffer =
+        let mut stdout =
             b"sftp> pwd\nRemote working directory: /home/dev\nsftp> -tok\nnext".to_vec();
-        let content = cut(&mut buffer, b"sftp> -tok\n").unwrap();
+        let mut stderr = b"Invalid command.\nlater".to_vec();
+        let frame = cut_frame(&mut stdout, &mut stderr, "tok").unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&content),
+            frame.stdout,
             "sftp> pwd\nRemote working directory: /home/dev\n"
         );
         assert_eq!(
-            String::from_utf8_lossy(&buffer),
+            String::from_utf8_lossy(&stdout),
             "next",
             "what arrived after the fence belongs to the next command"
         );
+        assert_eq!(String::from_utf8_lossy(&stderr), "later");
     }
 
     #[test]
     fn a_marker_that_has_not_arrived_yet_is_not_a_frame() {
-        let mut buffer = b"sftp> pwd\nsftp> -to".to_vec();
-        assert_eq!(
-            cut(&mut buffer, b"sftp> -tok\n"),
-            None,
+        let mut stdout = b"sftp> pwd\nsftp> -to".to_vec();
+        let mut stderr = b"Invalid command.\n".to_vec();
+        assert!(
+            cut_frame(&mut stdout, &mut stderr, "tok").is_none(),
             "half a marker must not end a frame"
         );
         assert_eq!(
-            buffer.len(),
-            19,
-            "and the buffer must be left intact for the next read"
+            (stdout.len(), stderr.len()),
+            (19, 17),
+            "and both buffers must be left intact for the next read"
         );
     }
 
@@ -429,6 +443,43 @@ mod tests {
             String::from_utf8_lossy(&buffer),
             "Can't ls: \"/y\" not found\r\n"
         );
+    }
+
+    /// The Windows build of OpenSSH's sftp ends every line with `\r\n`, the
+    /// echoed fence included.
+    #[test]
+    fn a_frame_ends_at_the_fence_whatever_the_line_ending() {
+        for newline in ["\n", "\r\n"] {
+            let mut stdout = format!(
+                "sftp> -pwd{newline}Remote working directory: /root{newline}sftp> -tok{newline}next"
+            )
+            .into_bytes();
+            let mut stderr = format!("Invalid command.{newline}").into_bytes();
+            let frame = cut_frame(&mut stdout, &mut stderr, "tok")
+                .unwrap_or_else(|| panic!("no frame with {newline:?} line endings"));
+            assert!(frame.stdout.contains("Remote working directory: /root"));
+            assert_eq!(frame.stderr, "");
+            assert_eq!(
+                String::from_utf8_lossy(&stdout),
+                "next",
+                "what follows the fence belongs to the next command"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    /// The two pipes are drained separately, so the fence can come back on
+    /// one before the other. What has already arrived must survive the wait.
+    #[test]
+    fn a_frame_waits_for_both_halves_without_losing_either() {
+        let mut stdout = b"Remote working directory: /root\nsftp> -tok\n".to_vec();
+        let mut stderr = Vec::new();
+        assert!(cut_frame(&mut stdout, &mut stderr, "tok").is_none());
+
+        stderr.extend_from_slice(b"Invalid command.\n");
+        let frame = cut_frame(&mut stdout, &mut stderr, "tok")
+            .unwrap_or_else(|| panic!("both halves have arrived"));
+        assert_eq!(frame.stdout, "Remote working directory: /root\n");
     }
 
     /// The token guards against a remote file name forging a frame marker, so

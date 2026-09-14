@@ -7,7 +7,20 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- On Windows, setting up a Fast Mode host stopped at "Asking … where home is"
+  and waited out two timeouts. Clift reads each reply from `sftp` up to a
+  marker line, and the Windows build of OpenSSH ends its lines with `\r\n`, so
+  the marker never matched. It now matches up to the end of the line, whatever
+  the line ending. A reply whose two halves arrived apart could also be lost
+  while Clift waited for the second one; that is fixed as well.
+- On Windows, setup then stopped with "did not report the permissions". The
+  Windows `sftp` client prints group and other permissions as `*`, so from there
+  `0700` and `0777` look the same. Clift now checks the owner's permissions it
+  can see and still refuses anything wrong there, and `setup` and `doctor` say
+  plainly that group and other could not be checked, with a command that shows
+  them. Directories Clift creates are still set to `0700` by Clift itself.
 
 ## [0.1.1] - 2026-09-08
 

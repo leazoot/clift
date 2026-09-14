@@ -103,6 +103,48 @@ fn all_thirteen_checks_are_reported_in_order_every_time() {
     }
 }
 
+/// Through a client that hides group and other permissions, the inbox check
+/// warns rather than passes, and names a command that shows the rest.
+#[test]
+fn an_inbox_seen_without_group_and_other_permissions_is_a_warning() {
+    let transport = healthy_transport();
+    transport.hide_mode_bits(0o077);
+    let ssh_config = FakeSshConfig::resolving("dev", "192.0.2.10", 2222);
+    let environment = Environment {
+        facts: facts(),
+        ssh_config: &ssh_config,
+        remote: &transport,
+        upload: &transport,
+        clipboard: None,
+        remote_dir: None,
+        injection: None,
+        relay: None,
+        config: healthy_config(),
+    };
+
+    let report = diagnose(&environment, Some(&target()));
+    assert_eq!(
+        status_of(&report, CheckName::InboxPermissions),
+        CheckStatus::Warn
+    );
+    let detail = detail_of(&report, CheckName::InboxPermissions);
+    assert!(detail.contains("group and other"), "{detail}");
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == CheckName::InboxPermissions)
+        .unwrap();
+    assert!(
+        format!("{check:?}").contains("ls -ld"),
+        "the warning must come with a way to see the rest: {check:?}"
+    );
+    assert_eq!(
+        status_of(&report, CheckName::UploadAndCleanup),
+        CheckStatus::Pass,
+        "the owner's bits were right, so the send checks still run"
+    );
+}
+
 /// A check that fails must not stop the ones after it.
 #[test]
 fn one_failure_does_not_stop_the_remaining_checks() {

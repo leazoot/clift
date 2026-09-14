@@ -14,7 +14,7 @@ use crate::context::SshHostSettings;
 use crate::domain::{RemotePath, TargetName};
 use crate::error::{CliftError, ErrorKind, Remedy, Stage};
 use crate::ports::{CheckStatus, Clock, RemoteFs, RemoteUpload, TransportTarget};
-use crate::staging::{ensure_inbox, verify_round_trip};
+use crate::staging::{ensure_inbox, partly_checked_permissions, verify_round_trip};
 
 /// One step of `setup`, as the user sees it.
 ///
@@ -121,6 +121,14 @@ where
     // writes one, and it writes the default.
     let location = ensure_inbox(transport, &target, None)?;
     steps.push(SetupStep::PrivateInbox);
+    let mut warnings: Vec<String> = location.warning().into_iter().collect();
+    if let Some(partly) = partly_checked_permissions(transport, &target, location.root())? {
+        warnings.push(format!(
+            "{partly}. To see all of it: ssh {} ls -ld '{}'",
+            target.ssh_host(),
+            location.root()
+        ));
+    }
 
     verify_round_trip(transport, transport, &target, location.root())?;
     steps.push(SetupStep::UploadAndCleanup);
@@ -142,7 +150,7 @@ where
         remote_home: location.home().clone(),
         inbox: location.root().clone(),
         steps,
-        warnings: location.warning().into_iter().collect(),
+        warnings,
         config,
     })
 }
@@ -281,6 +289,39 @@ mod tests {
     }
 
     /// An existing default target is not quietly moved to the new host.
+    /// Seen through a client that hides group and other permissions, setup
+    /// still succeeds, and says what it could not check.
+    #[test]
+    fn a_host_seen_without_group_and_other_permissions_is_named_in_a_warning() {
+        let transport = RecordingTransport::new("/home/dev");
+        transport.hide_mode_bits(0o077);
+        let report = prepare_target(
+            &transport,
+            settings(),
+            &Config::default(),
+            &name(),
+            &clock(),
+        )
+        .unwrap();
+        assert!(
+            report.warnings().iter().any(|warning| {
+                warning.contains("group and other")
+                    && warning.contains("ls -ld '/home/dev/.cache/clift/inbox'")
+            }),
+            "{:?}",
+            report.warnings()
+        );
+
+        let full = RecordingTransport::new("/home/dev");
+        let report =
+            prepare_target(&full, settings(), &Config::default(), &name(), &clock()).unwrap();
+        assert!(
+            report.warnings().is_empty(),
+            "a client that shows every bit has nothing to warn about: {:?}",
+            report.warnings()
+        );
+    }
+
     #[test]
     fn setting_up_a_second_host_does_not_steal_the_default() {
         let transport = RecordingTransport::new("/home/dev");

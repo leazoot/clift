@@ -416,6 +416,7 @@ impl OpenSshTransport {
                     kind: parsed.kind,
                     size: parsed.size,
                     mode: parsed.mode,
+                    hidden_mode_bits: parsed.hidden_mode_bits,
                     modified: parsed.modified,
                 },
             ));
@@ -449,14 +450,22 @@ fn check_existing(
             format!("{path} on {} is not a directory", target.ssh_host()),
         ));
     }
+    // Only what the listing showed can be compared, and the owner's bits must
+    // be among it: they are the ones that make a directory private at all.
+    let hidden = existing.hidden_mode_bits;
     match existing.mode {
-        Some(actual) if actual == mode => Ok(()),
-        Some(actual) => Err(CliftError::new(
+        Some(actual) if hidden & 0o700 == 0 && actual & !hidden == mode & !hidden => Ok(()),
+        Some(actual) if hidden & 0o700 == 0 => Err(CliftError::new(
             Stage::Staging,
             ErrorKind::RemoteDirectory,
             format!(
-                "{path} on {} has mode {actual:04o}, but Clift requires {mode:04o}",
-                target.ssh_host()
+                "{path} on {} has mode {actual:04o}, but Clift requires {mode:04o}{}",
+                target.ssh_host(),
+                if hidden == 0 {
+                    ""
+                } else {
+                    " (the sftp client on this computer does not show group and other permissions)"
+                }
             ),
         )
         .with_remedy(Remedy::new(
@@ -464,7 +473,7 @@ fn check_existing(
              Set them yourself if that is what you want:",
             format!("ssh {} chmod {mode:o} {path}", target.ssh_host()),
         ))),
-        None => Err(CliftError::new(
+        _ => Err(CliftError::new(
             Stage::Staging,
             ErrorKind::RemoteDirectory,
             format!(
@@ -519,6 +528,7 @@ struct ParsedLine {
     kind: RemoteEntryKind,
     size: u64,
     mode: Option<u32>,
+    hidden_mode_bits: u32,
     modified: Option<SystemTime>,
 }
 
@@ -557,29 +567,43 @@ fn parse_listing_line(line: &str, now: SystemTime) -> Option<ParsedLine> {
         return None;
     }
 
+    let (mode, hidden_mode_bits) = match parse_mode(permissions) {
+        Some((mode, hidden)) => (Some(mode), hidden),
+        None => (None, 0),
+    };
     Some(ParsedLine {
         name,
         kind,
         size,
-        mode: parse_mode(permissions),
+        mode,
+        hidden_mode_bits,
         modified,
     })
 }
 
-/// Turns `drwx------` into `0o700`.
-fn parse_mode(permissions: &str) -> Option<u32> {
+/// Turns `drwx------` into `0o700`, together with the bits that were not shown.
+///
+/// The Windows build of OpenSSH's `sftp` prints `drwx******`: the owner's bits
+/// and nothing about group or other. Each `*` is a bit that client cannot see.
+/// It comes back in the second value, with zero in its place in the first.
+fn parse_mode(permissions: &str) -> Option<(u32, u32)> {
     let bits: Vec<char> = permissions.chars().skip(1).take(9).collect();
     if bits.len() != 9 {
         return None;
     }
     let mut mode = 0;
+    let mut hidden = 0;
     for (index, bit) in bits.iter().enumerate() {
         let value = match index % 3 {
             0 => 0o4,
             1 => 0o2,
             _ => 0o1,
-        };
+        } << (6 - 3 * (index / 3));
         let set = match (index % 3, bit) {
+            (_, '*') => {
+                hidden |= value;
+                false
+            }
             (_, '-') => false,
             (0, 'r') | (1, 'w') => true,
             // The execute column doubles as setuid, setgid and sticky.
@@ -588,10 +612,10 @@ fn parse_mode(permissions: &str) -> Option<u32> {
             _ => return None,
         };
         if set {
-            mode |= value << (6 - 3 * (index / 3));
+            mode |= value;
         }
     }
-    Some(mode)
+    Some((mode, hidden))
 }
 
 /// Parses the three date fields `sftp` prints, which are rendered in UTC
@@ -718,12 +742,15 @@ mod tests {
 
     #[test]
     fn permission_columns_become_octal_modes() {
-        assert_eq!(parse_mode("drwx------"), Some(0o700));
-        assert_eq!(parse_mode("-rw-------"), Some(0o600));
-        assert_eq!(parse_mode("drwxr-xr-x"), Some(0o755));
-        assert_eq!(parse_mode("-rw-rw-r--"), Some(0o664));
-        assert_eq!(parse_mode("drwxrwxrwt"), Some(0o777));
+        assert_eq!(parse_mode("drwx------"), Some((0o700, 0)));
+        assert_eq!(parse_mode("-rw-------"), Some((0o600, 0)));
+        assert_eq!(parse_mode("drwxr-xr-x"), Some((0o755, 0)));
+        assert_eq!(parse_mode("-rw-rw-r--"), Some((0o664, 0)));
+        assert_eq!(parse_mode("drwxrwxrwt"), Some((0o777, 0)));
         assert_eq!(parse_mode("short"), None);
+        // The Windows build of OpenSSH's sftp shows the owner's bits only.
+        assert_eq!(parse_mode("drwx******"), Some((0o700, 0o077)));
+        assert_eq!(parse_mode("-rw-******"), Some((0o600, 0o077)));
     }
 
     /// The exact bytes OpenSSH 9.9's sftp printed in the test container.
@@ -763,6 +790,63 @@ mod tests {
                 .map(|since| since.as_secs()),
             Some(1_788_093_240),
             "2026-08-30 12:34 UTC"
+        );
+    }
+
+    /// The Windows build of OpenSSH's sftp shows only the owner's permission
+    /// bits and prints group and other as `*`. This is the exact line it
+    /// printed for a directory whose real mode was 0700.
+    #[test]
+    fn a_windows_listing_line_reports_the_owner_bits_it_shows() {
+        let now = at(1_788_150_000);
+        let parsed = parse_listing_line(
+            "drwx******    ? root     root         4096 Sep 14 15:58 /root/.cache/clift",
+            now,
+        )
+        .unwrap();
+        assert_eq!(parsed.name, "clift");
+        assert_eq!(parsed.kind, RemoteEntryKind::Directory);
+        assert_eq!(parsed.size, 4096);
+        assert_eq!(parsed.mode, Some(0o700));
+        assert_eq!(
+            parsed.hidden_mode_bits, 0o077,
+            "group and other were not shown, which is not the same as clear"
+        );
+    }
+
+    /// Seen from Windows, a directory is held to the bits the client shows,
+    /// and never waved through on bits it hides.
+    #[test]
+    fn a_directory_seen_from_windows_is_judged_on_the_bits_it_shows() {
+        let target = TransportTarget::new("dev126");
+        let path = RemotePath::new("/root/.cache/clift").unwrap();
+        let seen = |permissions: &str| {
+            let line = format!(
+                "{permissions}    ? root     root         4096 Sep 14 15:58 /root/.cache/clift"
+            );
+            let parsed = parse_listing_line(&line, at(1_788_150_000)).unwrap();
+            RemoteEntry {
+                name: SafeFileName::new(parsed.name).unwrap(),
+                kind: parsed.kind,
+                size: parsed.size,
+                mode: parsed.mode,
+                hidden_mode_bits: parsed.hidden_mode_bits,
+                modified: parsed.modified,
+            }
+        };
+
+        assert!(check_existing(&target, &path, 0o700, &seen("drwx******")).is_ok());
+        assert!(
+            check_existing(&target, &path, 0o700, &seen("drw-******")).is_err(),
+            "the owner bits it does show still have to be right"
+        );
+        assert!(
+            check_existing(&target, &path, 0o700, &seen("d*********")).is_err(),
+            "a listing that shows no owner bits cannot vouch for anything"
+        );
+        assert!(
+            check_existing(&target, &path, 0o700, &seen("drwxr-xr-x")).is_err(),
+            "a full listing is still held to every bit"
         );
     }
 
