@@ -7,66 +7,36 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.2] - 2026-09-15
+
 ### Changed
 
-- Fast Mode speaks SFTP itself, over the system `ssh` (`ssh -s <host> sftp`),
-  instead of driving the `sftp` program and reading what it prints. Reaching
-  and trusting the host is still entirely `ssh`'s job: your configuration,
-  known_hosts, agent, hardware keys and ProxyJump all apply as before. A send
-  is now one connection and one SFTP session on every platform, including
-  clients that cannot reuse connections, and the `sftp` program is no longer
-  needed. `doctor` drops its "sftp client" check and reports twelve.
-- The hotkey helper keeps its SSH connection open between presses, for up to
-  `connection.persist` (an hour unless configured), and checks now and
-  then that it is still alive. It also remembers, for as long, where the host
-  keeps its caches. The first Fast Mode press after a quiet spell connects and
-  asks as before; the presses after it do neither. On a client that cannot
-  reuse connections, Windows among them, each of those was a login of its own
-  and together they were most of the wait.
-- A Fast Mode send no longer asks the host for its home directory or its cache
-  directory when `setup` already recorded them, and the occasional tidy-up of
-  expired batches runs after the text has been typed or printed rather than
-  before. Where connections cannot be reused, Windows among such clients, that
-  makes a send one login instead of two. `setup` now records the cache
-  directory as `remote_cache_home`; a target set up with an earlier version
-  gets it the next time `clift setup` runs for it, and works as before until
-  then.
-- A send asks for the inbox check and the new batch directory in one exchange,
-  and an upload sends the size check and the close along with its last write.
-  Each saves a round trip, which on a distant host is a quarter of a second or
-  more on every press. The checks themselves are unchanged, and a batch
-  directory created next to an inbox that fails its check is removed again.
-- `--verbose` on `send` and `paste` says how long each remote operation took.
-- `connection.persist` defaults to an hour instead of ten minutes, and can be
-  set to at most a day instead of an hour. Restart the hotkey helper after
-  changing it: `clift hotkey --install` stops the running one and starts a new
-  one.
+- Fast Mode speaks SFTP over the system `ssh` (`ssh -s <host> sftp`) instead
+  of driving the `sftp` program. Authentication, known_hosts, agent and
+  ProxyJump are still handled by `ssh`. The `sftp` program is no longer needed,
+  and `doctor` no longer checks for it.
+- The hotkey helper keeps its connection open between presses.
+  `connection.persist` now defaults to 1 hour (was 10 minutes) and allows up to
+  24 hours (was 1 hour). After changing it, run `clift hotkey --install` to
+  restart the helper.
+- `setup` records the host's cache directory, so a send logs in once. Run
+  `clift setup` again for targets set up with an earlier version.
+- Fewer round trips per send. `--verbose` shows how long each remote step took.
 
 ### Fixed
 
-- On Windows a Fast Mode send took close to a minute, and setup could stall at
-  "Creating a directory". The Windows build of `sftp` holds its output until it
-  exits, so every step of a send became a new process and a new login. A send
-  now logs in once.
-- On Windows, sending a file by path failed with `stat ////?//D://...`: the
-  path reached `sftp` in a form it could not read. Clift now reads the file
-  itself and sends its bytes.
-- Directories and uploaded files are created with their permissions in the
-  same request, and permissions are read as numbers the server reports rather
-  than from a listing, which the Windows client printed as `drwx******`.
-- A request still waiting for the server when the time limit ran out could be
-  sent again, so a `rename` could happen twice. A request that has been sent is
-  now reported as failed and never repeated.
-- `clift send` with a file that is not there said the clipboard had failed,
-  and suggested `ls -l`, which PowerShell does not have. It now says the file
-  does not exist, and on Windows the commands it offers for looking at a file
-  or archiving a folder are ones PowerShell runs.
+- Windows: Fast Mode sends took close to a minute. They now log in once.
+- Windows: sending a file by path failed with `stat ////?//D://...`.
+- Windows: permissions listed as `drwx******` could not be checked.
+- A request that ran out of time could be sent again.
+- A missing file was reported as a clipboard failure, with a remedy PowerShell
+  cannot run.
 
 ### Security
 
-- rustls 0.23.45, for RUSTSEC-2026-0285: TLS 1.3 handshake messages were
-  accepted across encryption level boundaries. Clift uses TLS only to reach the
-  relay.
+- rustls 0.23.45, for RUSTSEC-2026-0285.
 
 ## [0.1.1] - 2026-09-08
 
