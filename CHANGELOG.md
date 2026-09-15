@@ -49,6 +49,12 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sent again, so a `rename` could happen twice. A request that has been sent is
   now reported as failed and never repeated.
 
+### Security
+
+- rustls 0.23.45, for RUSTSEC-2026-0285: TLS 1.3 handshake messages were
+  accepted across encryption level boundaries. Clift uses TLS only to reach the
+  relay.
+
 ## [0.1.1] - 2026-09-08
 
 ### Fixed
