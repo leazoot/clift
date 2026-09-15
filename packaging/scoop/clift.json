@@ -1,13 +1,13 @@
 {
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Paste a screenshot into the coding agent running on your server",
   "homepage": "https://github.com/leazoot/clift",
   "license": "Apache-2.0",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/leazoot/clift/releases/download/v0.1.1/clift-0.1.1-x86_64-pc-windows-msvc.zip",
-      "hash": "b0e85ae491633a2de8f77522d31fca7fe57b67ae9ff42bc8cf8621710f970aa3",
-      "extract_dir": "clift-0.1.1-x86_64-pc-windows-msvc"
+      "url": "https://github.com/leazoot/clift/releases/download/v0.1.2/clift-0.1.2-x86_64-pc-windows-msvc.zip",
+      "hash": "788a309d3f887746274350506ec051240d2939141f61c09084e0e5d325493fb4",
+      "extract_dir": "clift-0.1.2-x86_64-pc-windows-msvc"
     }
   },
   "bin": [
