@@ -338,6 +338,88 @@ fn operations_within_the_idle_limit_share_one_session() {
     assert_eq!(sftp_sessions(&fixture) - before, 1);
 }
 
+/// A kept session whose server has stopped answering is found out by the
+/// check between presses, and the next press opens a new session instead of
+/// waiting out the whole timeout on the dead one.
+///
+/// The server's `sftp-server` is paused, which from the client looks exactly
+/// like a connection a NAT or proxy has dropped: requests go out and nothing
+/// comes back.
+#[test]
+fn a_kept_session_that_stops_answering_is_replaced_before_the_next_press() {
+    if skip_without_docker("a_kept_session_that_stops_answering_is_replaced_before_the_next_press")
+    {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let check_limit = Duration::from_secs(2);
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions()
+            .with_idle_limit(Duration::from_secs(60))
+            .with_liveness_check(Duration::from_secs(1), check_limit),
+    );
+    transport.resolve_home(&target).unwrap();
+    let opened = sftp_sessions(&fixture);
+
+    std::thread::sleep(Duration::from_millis(1_500));
+    signal_sftp_servers(&fixture, "STOP");
+    let started = Instant::now();
+    transport.tend_sessions();
+    let checked = started.elapsed();
+    // Resumed so that, had the check kept the session, the next operation
+    // would succeed on it and show up as no new session below.
+    signal_sftp_servers(&fixture, "CONT");
+    assert!(
+        checked < check_limit * 2,
+        "the check waited {checked:?}, not its own limit"
+    );
+
+    let started = Instant::now();
+    transport.resolve_home(&target).unwrap();
+    let pressed = started.elapsed();
+    assert_eq!(
+        sftp_sessions(&fixture) - opened,
+        1,
+        "the session that stopped answering was kept"
+    );
+    assert!(
+        pressed < Duration::from_secs(20),
+        "the next press waited on the dead session: {pressed:?}"
+    );
+}
+
+/// A quiet session that still answers survives the check, so checking never
+/// costs the next press a new connection.
+#[test]
+fn a_quiet_session_that_still_answers_is_kept() {
+    if skip_without_docker("a_quiet_session_that_still_answers_is_kept") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let target = TransportTarget::new(fixture.alias());
+    let transport = OpenSshTransport::with_runner(
+        SshRunner::new()
+            .with_config_file(fixture.ssh_config())
+            .with_sessions()
+            .with_idle_limit(Duration::from_secs(60))
+            .with_liveness_check(Duration::from_secs(1), Duration::from_secs(5)),
+    );
+    transport.resolve_home(&target).unwrap();
+    let opened = sftp_sessions(&fixture);
+
+    std::thread::sleep(Duration::from_millis(1_500));
+    transport.tend_sessions();
+    transport.resolve_home(&target).unwrap();
+    assert_eq!(
+        sftp_sessions(&fixture) - opened,
+        0,
+        "a session that answered its check was replaced"
+    );
+}
+
 /// The host is asked for its cache directory once, not on every key press.
 ///
 /// The question is an `ssh` command of its own rather than an SFTP request, so

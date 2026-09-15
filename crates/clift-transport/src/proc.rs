@@ -96,6 +96,10 @@ pub struct SshRunner {
     /// Per host: what it said about its cache directory. Only consulted while
     /// sessions are kept; see [`Self::remembered_cache_home`].
     cache_homes: Arc<Mutex<HashMap<String, Remembered>>>,
+    /// How long a kept session may sit quiet before it is checked, and how
+    /// long that check may take.
+    quiet_before_check: Duration,
+    check_limit: Duration,
 }
 
 /// A host's answer about its cache directory, and when it was last relied on.
@@ -143,6 +147,8 @@ impl SshRunner {
             sessions: None,
             idle_limit: None,
             cache_homes: Arc::new(Mutex::new(HashMap::new())),
+            quiet_before_check: QUIET_BEFORE_CHECK,
+            check_limit: CHECK_LIMIT,
         }
     }
 
@@ -190,6 +196,19 @@ impl SshRunner {
         self
     }
 
+    /// Checks a kept session once it has been quiet for `quiet`, allowing the
+    /// check `limit`.
+    ///
+    /// The defaults suit a key press. This exists so that the integration
+    /// tests can see what a check does to a real connection without sitting
+    /// through a minute of quiet first.
+    #[must_use]
+    pub fn with_liveness_check(mut self, quiet: Duration, limit: Duration) -> Self {
+        self.quiet_before_check = quiet;
+        self.check_limit = limit;
+        self
+    }
+
     /// Closes kept sessions that have been idle past the limit, and checks
     /// that the others are still alive.
     ///
@@ -210,6 +229,8 @@ impl SshRunner {
         };
         let now = Instant::now();
         let idle_limit = self.idle_limit;
+        let quiet_before_check = self.quiet_before_check;
+        let check_limit = self.check_limit;
         open.retain(|_, kept| {
             if idle_limit.is_some_and(|limit| now.duration_since(kept.last_used) >= limit) {
                 return false;
@@ -217,10 +238,10 @@ impl SshRunner {
             if !kept.session.is_usable() {
                 return false;
             }
-            if now.duration_since(kept.last_checked) < QUIET_BEFORE_CHECK {
+            if now.duration_since(kept.last_checked) < quiet_before_check {
                 return true;
             }
-            kept.session.start_operation_within(CHECK_LIMIT);
+            kept.session.start_operation_within(check_limit);
             let alive = kept.session.realpath(".").is_ok();
             kept.last_checked = Instant::now();
             alive
