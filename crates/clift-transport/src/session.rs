@@ -44,6 +44,14 @@ use std::time::{Duration, Instant};
 /// few enough that a refusal is noticed within a couple of megabytes.
 const WRITE_WINDOW: usize = 64;
 
+/// What one directory request found: whether the `mkdir` succeeded, and what
+/// the read-back sent with it saw at that path.
+pub type MkdirAnswer = (Result<(), Refusal>, Option<Attrs>);
+
+/// How writing a file ended: the first refusal, if any, and the ids of the
+/// read-back and the close, when they were sent.
+type Written = (Option<Failure>, Option<(u32, u32)>);
+
 /// How long a finished `ssh` may take to hand over the last of its stderr.
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 
@@ -224,22 +232,47 @@ impl SftpSession {
     /// # Errors
     /// Fails when the connection fails, or the read-back is refused for a
     /// reason other than the path not existing.
-    pub fn mkdir_and_lstat(
+    pub fn mkdir_and_lstat(&mut self, path: &str, mode: u32) -> Result<MkdirAnswer, Failure> {
+        let mut answers = self.mkdirs_and_lstats(&[path], mode)?;
+        match answers.pop() {
+            Some(answer) => Ok(answer),
+            None => Err(self.fail("one directory request got no answer".to_string(), false)),
+        }
+    }
+
+    /// [`Self::mkdir_and_lstat`] for several paths, with every request sent
+    /// before the first answer is read, so the whole set costs one round trip.
+    ///
+    /// The answers come back in the order of `paths`. A server handles the
+    /// requests in the order they arrive, so a path may name a directory an
+    /// earlier path in the same call creates.
+    ///
+    /// # Errors
+    /// As [`Self::mkdir_and_lstat`], for the first path that fails that way.
+    pub fn mkdirs_and_lstats(
         &mut self,
-        path: &str,
+        paths: &[&str],
         mode: u32,
-    ) -> Result<(Result<(), Refusal>, Option<Attrs>), Failure> {
-        let made = self.id();
-        let looked = self.id();
-        self.send(wire::mkdir(made, path, mode))?;
-        self.send(wire::lstat(looked, path))?;
-        let created = match self.expect_ok(made) {
-            Ok(()) => Ok(()),
-            Err(Failure::Refused(refusal)) => Err(refusal),
-            Err(other) => return Err(other),
-        };
-        let attrs = absent_as_none(self.expect_attrs(looked))?;
-        Ok((created, attrs))
+    ) -> Result<Vec<MkdirAnswer>, Failure> {
+        let mut asked = Vec::with_capacity(paths.len());
+        for path in paths {
+            let made = self.id();
+            let looked = self.id();
+            self.send(wire::mkdir(made, path, mode))?;
+            self.send(wire::lstat(looked, path))?;
+            asked.push((made, looked));
+        }
+        let mut answers = Vec::with_capacity(asked.len());
+        for (made, looked) in asked {
+            let created = match self.expect_ok(made) {
+                Ok(()) => Ok(()),
+                Err(Failure::Refused(refusal)) => Err(refusal),
+                Err(other) => return Err(other),
+            };
+            let attrs = absent_as_none(self.expect_attrs(looked))?;
+            answers.push((created, attrs));
+        }
+        Ok(answers)
     }
 
     /// Sets the permissions of `path`.
@@ -333,37 +366,54 @@ impl SftpSession {
         self.send(wire::open_exclusive(id, path, mode))?;
         let handle = self.expect_handle(id)?;
 
-        match self.write_all(&handle, source, mode) {
-            Ok(()) => {
-                let looked = self.id();
-                let closed = self.id();
-                self.send(wire::fstat(looked, &handle))?;
-                self.send(wire::close(closed, &handle))?;
-                let attrs = self.expect_attrs(looked);
-                let close = self.expect_ok(closed);
-                let attrs = attrs?;
-                close?;
-                Ok(attrs)
+        let (failure, closing) = self.write_all(&handle, source, mode)?;
+        let Some((looked, closed)) = closing else {
+            // Writing stopped before the end of the file. The refusal is what
+            // the caller needs; the handle is still released so the server can
+            // let go of the file, and whatever the close says is secondary.
+            let _ = self.close(&handle);
+            return Err(failure.unwrap_or_else(|| {
+                self.fail("the upload stopped without a reason".to_string(), false)
+            }));
+        };
+        let attrs = self.expect_attrs(looked);
+        let close = self.expect_ok(closed);
+        if let Some(failure) = failure {
+            // A write was refused after the read-back and the close had gone
+            // out. Their answers are collected above so the stream stays in
+            // step; the refusal is still the reason, unless the connection
+            // itself broke while they were read.
+            for answered in [attrs.err(), close.err()].into_iter().flatten() {
+                if matches!(answered, Failure::Broken { .. }) {
+                    return Err(answered);
+                }
             }
-            Err(failure @ Failure::Broken { .. }) => Err(failure),
-            Err(failure) => {
-                // The refusal is what the caller needs. The handle is still
-                // released so the server can let go of the file, and whatever
-                // the close says is secondary to why it was needed.
-                let _ = self.close(&handle);
-                Err(failure)
-            }
+            return Err(failure);
         }
+        let attrs = attrs?;
+        close?;
+        Ok(attrs)
     }
 
-    /// Sends the mode and every chunk of `source`, keeping at most
-    /// [`WRITE_WINDOW`] requests unanswered.
+    /// Sends the mode, every chunk of `source`, and then the read-back and the
+    /// close, keeping at most [`WRITE_WINDOW`] writes unanswered.
+    ///
+    /// The read-back and the close go out as soon as the last chunk has,
+    /// without waiting for the writes to be acknowledged, which saves a whole
+    /// round trip on every upload. A server handles requests on one handle in
+    /// the order they arrive; and the size and mode that come back are checked
+    /// before anything is renamed, so a server that did otherwise would fail
+    /// that check rather than pass it.
+    ///
+    /// Returns the first refusal, if any, and the ids of the read-back and the
+    /// close when they were sent. They are not sent once a refusal or a local
+    /// read error has stopped the writing.
     fn write_all(
         &mut self,
         handle: &[u8],
         source: &mut dyn Read,
         mode: u32,
-    ) -> Result<(), Failure> {
+    ) -> Result<Written, Failure> {
         let mut pending = VecDeque::new();
         let first = self.id();
         self.send(wire::fsetstat_mode(first, handle, mode))?;
@@ -373,6 +423,7 @@ impl SftpSession {
         let mut offset = 0_u64;
         let mut finished = false;
         let mut failure = None;
+        let mut closing = None;
 
         loop {
             while failure.is_none() && !finished && pending.len() < WRITE_WINDOW {
@@ -391,6 +442,13 @@ impl SftpSession {
                 }
                 finished = read < buffer.len();
             }
+            if finished && failure.is_none() && closing.is_none() {
+                let looked = self.id();
+                let closed = self.id();
+                self.send(wire::fstat(looked, handle))?;
+                self.send(wire::close(closed, handle))?;
+                closing = Some((looked, closed));
+            }
             let Some(id) = pending.pop_front() else {
                 break;
             };
@@ -406,7 +464,7 @@ impl SftpSession {
                 }
             }
         }
-        failure.map_or(Ok(()), Err)
+        Ok((failure, closing))
     }
 
     fn close(&mut self, handle: &[u8]) -> Result<(), Failure> {

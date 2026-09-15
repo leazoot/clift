@@ -208,13 +208,28 @@ pub fn ensure_inbox_from(
     known_cache_home: Option<&RemotePath>,
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
+    let location = locate_inbox_from(remote, target, known_home, known_cache_home, configured)?;
+    remote.ensure_dir(target, location.root(), INBOX_MODE)?;
+    Ok(location)
+}
+
+/// Works out where the inbox belongs from what is already known about the
+/// host, asking only for what is not, and creating nothing.
+///
+/// # Errors
+/// As [`locate_inbox`].
+pub fn locate_inbox_from(
+    remote: &dyn RemoteFs,
+    target: &TransportTarget,
+    known_home: Option<&RemotePath>,
+    known_cache_home: Option<&RemotePath>,
+    configured: Option<&str>,
+) -> Result<InboxLocation, CliftError> {
     let home = match known_home {
         Some(home) => home.clone(),
         None => remote.resolve_home(target)?,
     };
-    let location = locate_from(remote, target, home, known_cache_home, configured)?;
-    remote.ensure_dir(target, location.root(), INBOX_MODE)?;
-    Ok(location)
+    locate_from(remote, target, home, known_cache_home, configured)
 }
 
 /// The configured location, when it is one that changes anything.

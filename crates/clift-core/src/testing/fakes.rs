@@ -235,6 +235,20 @@ impl RemoteFs for RecordingTransport {
         Ok(())
     }
 
+    /// One `EnsureDir` per path, in order, stopping at the first failure:
+    /// what the real transport decides, without the round trips it saves.
+    fn ensure_dirs(
+        &self,
+        target: &TransportTarget,
+        paths: &[&RemotePath],
+        mode: u32,
+    ) -> Result<(), CliftError> {
+        for path in paths {
+            self.ensure_dir(target, path, mode)?;
+        }
+        Ok(())
+    }
+
     fn stat(
         &self,
         _target: &TransportTarget,

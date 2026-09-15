@@ -200,6 +200,24 @@ pub trait RemoteFs {
         mode: u32,
     ) -> Result<(), CliftError>;
 
+    /// Creates several directories with exactly `mode`, as
+    /// [`Self::ensure_dir`] does one, in the order given.
+    ///
+    /// For the checks a send makes on every press, which on a distant host are
+    /// worth asking in one exchange. They are still settled in order: the
+    /// first that fails stops the rest, and a later directory this call created
+    /// before that failure was known is removed again, so a failure leaves
+    /// nothing behind that was not already there.
+    ///
+    /// # Errors
+    /// As [`Self::ensure_dir`], for the first directory that fails.
+    fn ensure_dirs(
+        &self,
+        target: &TransportTarget,
+        paths: &[&RemotePath],
+        mode: u32,
+    ) -> Result<(), CliftError>;
+
     /// Returns metadata for a path, or `None` if it does not exist.
     ///
     /// # Errors

@@ -31,6 +31,11 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directory as `remote_cache_home`; a target set up with an earlier version
   gets it the next time `clift setup` runs for it, and works as before until
   then.
+- A send asks for the inbox check and the new batch directory in one exchange,
+  and an upload sends the size check and the close along with its last write.
+  Each saves a round trip, which on a distant host is a quarter of a second or
+  more on every press. The checks themselves are unchanged, and a batch
+  directory created next to an inbox that fails its check is removed again.
 - `--verbose` on `send` and `paste` says how long each remote operation took.
 
 ### Fixed

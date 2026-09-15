@@ -11,8 +11,8 @@ use crate::error::{CliftError, ErrorKind, Remedy, Stage};
 use crate::format::render;
 use crate::ports::{Clock, IdSource, RemoteFs, RemoteUpload, TransportTarget};
 use crate::staging::{
-    Action, BatchPlan, InboxLocation, Retention, StagedBatch, clean, create_batch,
-    ensure_inbox_from, plan_batch, stage_batch,
+    Action, BatchPlan, InboxLocation, Retention, StagedBatch, clean, create_batch, create_batch_in,
+    locate_inbox_from, plan_batch, stage_batch,
 };
 use std::time::Duration;
 
@@ -141,7 +141,7 @@ where
             ))
     })?;
 
-    let inbox: InboxLocation = ensure_inbox_from(
+    let inbox: InboxLocation = locate_inbox_from(
         transport,
         target,
         remote_home,
@@ -149,7 +149,8 @@ where
         remote_dir,
     )?;
     let plan = plan_batch(&inbox, clock, ids)?;
-    let batch = stage_attachments(transport, target, &plan, limits, attachments)?;
+    create_batch_in(transport, target, &inbox, &plan)?;
+    let batch = stage_batch(transport, target, &plan, attachments)?;
 
     let paths: Vec<RemotePath> = batch
         .files()

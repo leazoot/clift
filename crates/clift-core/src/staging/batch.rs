@@ -93,6 +93,26 @@ pub fn create_batch(
     remote.ensure_dir(target, plan.directory(), INBOX_MODE)
 }
 
+/// Checks that the inbox is still private and creates the batch inside it,
+/// asked of the host together.
+///
+/// The same two checks as ensuring the inbox and then [`create_batch`]: the
+/// inbox is checked on every send, and on a distant host each question asked
+/// on its own is a round trip the user waits for. They are still settled in
+/// order, so a batch is only kept in an inbox that passed.
+///
+/// # Errors
+/// Fails when the inbox exists with different permissions, or when either
+/// directory cannot be created.
+pub fn create_batch_in(
+    remote: &dyn RemoteFs,
+    target: &TransportTarget,
+    inbox: &InboxLocation,
+    plan: &BatchPlan,
+) -> Result<(), CliftError> {
+    remote.ensure_dirs(target, &[inbox.root(), plan.directory()], INBOX_MODE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

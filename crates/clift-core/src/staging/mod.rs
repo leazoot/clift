@@ -9,10 +9,11 @@ mod local;
 mod selfcheck;
 
 pub use atomic::{StagedBatch, StagedFile, stage_batch};
-pub use batch::{BatchPlan, create_batch, plan_batch};
+pub use batch::{BatchPlan, create_batch, create_batch_in, plan_batch};
 pub use clean::{Action, CleanReport, Retention, clean};
 pub use inbox::{
     INBOX_MODE, InboxLocation, InboxRootSource, ensure_inbox, ensure_inbox_from, locate_inbox,
+    locate_inbox_from,
 };
 pub use local::{WrittenBatch, WrittenFile, inbox_root as local_inbox_root, write_batch};
 pub use selfcheck::{SELF_CHECK_NAME, verify_round_trip};

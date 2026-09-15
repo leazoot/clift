@@ -281,6 +281,18 @@ impl<T: RemoteFs> RemoteFs for Narrating<'_, T> {
         )
     }
 
+    fn ensure_dirs(
+        &self,
+        target: &TransportTarget,
+        paths: &[&RemotePath],
+        mode: u32,
+    ) -> Result<(), CliftError> {
+        self.narrate(
+            format!("Creating directories on {}", target.ssh_host()),
+            |inner| inner.ensure_dirs(target, paths, mode),
+        )
+    }
+
     fn stat(
         &self,
         target: &TransportTarget,

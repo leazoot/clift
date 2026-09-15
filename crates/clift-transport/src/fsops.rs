@@ -156,6 +156,44 @@ impl OpenSshTransport {
         }
     }
 
+    /// [`Self::ensure_dir`] for several directories, with the first request
+    /// for every one of them sent together.
+    ///
+    /// Each is then settled in order, exactly as `ensure_dir` settles one. The
+    /// first that fails stops the rest, and a later directory this call had
+    /// already created is removed again: it may be sitting inside the one that
+    /// just failed its check, and a failure should leave nothing behind that
+    /// was not already there.
+    ///
+    /// # Errors
+    /// As [`Self::ensure_dir`], for the first directory that fails.
+    pub fn ensure_dirs(
+        &self,
+        target: &TransportTarget,
+        paths: &[&RemotePath],
+        mode: u32,
+    ) -> Result<(), CliftError> {
+        match self
+            .runner()
+            .sftp(target, |session| ensure_all(session, target, paths, mode))
+        {
+            Ok(verdict) => verdict,
+            Err(failure) => {
+                let named = paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(self.runner().session_error(
+                    target,
+                    Stage::Staging,
+                    &format!("could not create {named}"),
+                    failure,
+                ))
+            }
+        }
+    }
+
     /// Metadata for one path, or `None` when it does not exist.
     ///
     /// A symbolic link is reported as a link, never as what it points at.
@@ -321,6 +359,40 @@ fn ensure_in(
         ))),
         made => settle(session, target, path, mode, made, attrs),
     }
+}
+
+/// Asks for every directory at once, then settles each in order.
+fn ensure_all(
+    session: &mut SftpSession,
+    target: &TransportTarget,
+    paths: &[&RemotePath],
+    mode: u32,
+) -> Verdict<()> {
+    let texts: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+    let answers = session.mkdirs_and_lstats(&texts, mode)?;
+    let created: Vec<bool> = answers.iter().map(|(made, _)| made.is_ok()).collect();
+
+    for (index, (path, (made, attrs))) in paths.iter().zip(answers).enumerate() {
+        let missing_parent = matches!(&made, Err(refusal) if refusal.code == status::NO_SUCH_FILE);
+        let verdict = if missing_parent {
+            ensure_in(session, target, path, mode)?
+        } else {
+            settle(session, target, path, mode, made, attrs)?
+        };
+        let Err(wrong) = verdict else {
+            continue;
+        };
+        for (later, made_here) in paths.iter().zip(&created).skip(index + 1).rev() {
+            if *made_here {
+                // What matters is why the earlier directory failed. If this
+                // removal fails as well, the directory it leaves is empty and
+                // private, and the report still names the real problem.
+                let _ = session.rmdir(later.as_str());
+            }
+        }
+        return Ok(Err(wrong));
+    }
+    Ok(Ok(()))
 }
 
 /// Decides what a `mkdir` and the read-back after it mean.
@@ -515,6 +587,15 @@ impl RemoteFs for OpenSshTransport {
         mode: u32,
     ) -> Result<(), CliftError> {
         OpenSshTransport::ensure_dir(self, target, path, mode)
+    }
+
+    fn ensure_dirs(
+        &self,
+        target: &TransportTarget,
+        paths: &[&RemotePath],
+        mode: u32,
+    ) -> Result<(), CliftError> {
+        OpenSshTransport::ensure_dirs(self, target, paths, mode)
     }
 
     fn stat(
