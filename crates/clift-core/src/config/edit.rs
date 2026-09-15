@@ -44,6 +44,7 @@ const TARGET_FIELDS: &[(&str, ValueKind)] = &[
     ("remote_dir", ValueKind::Text),
     ("format", ValueKind::Text),
     ("remote_home", ValueKind::Text),
+    ("remote_cache_home", ValueKind::Text),
     ("last_success_at", ValueKind::Text),
 ];
 

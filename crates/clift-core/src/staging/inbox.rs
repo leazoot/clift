@@ -56,6 +56,7 @@ pub struct InboxLocation {
     root: RemotePath,
     home: RemotePath,
     source: InboxRootSource,
+    cache_home: Option<RemotePath>,
 }
 
 impl InboxLocation {
@@ -75,6 +76,17 @@ impl InboxLocation {
     #[must_use]
     pub fn source(&self) -> &InboxRootSource {
         &self.source
+    }
+
+    /// The host's cache directory this location was worked out from: its
+    /// `XDG_CACHE_HOME`, or `~/.cache` when it names none, which is what the
+    /// XDG convention means by an unset variable. `None` when a configured
+    /// location made the question moot. Worth caching in the config for the
+    /// same reason as [`Self::home`]: handed back to [`ensure_inbox_from`], it
+    /// resolves to this same root without asking.
+    #[must_use]
+    pub fn cache_home(&self) -> Option<&RemotePath> {
+        self.cache_home.as_ref()
     }
 
     /// What the user should be told about this choice, if anything.
@@ -126,6 +138,7 @@ fn configured_root(home: &RemotePath, value: &str) -> Result<InboxLocation, Clif
         root,
         home: home.clone(),
         source: InboxRootSource::Configured,
+        cache_home: None,
     })
 }
 
@@ -140,21 +153,23 @@ pub fn locate_inbox(
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
     let home = remote.resolve_home(target)?;
-    locate_from(remote, target, home, configured)
+    locate_from(remote, target, home, None, configured)
 }
 
 fn locate_from(
     remote: &dyn RemoteFs,
     target: &TransportTarget,
     home: RemotePath,
+    known_cache_home: Option<&RemotePath>,
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
-    // Only asked for when it can still change the answer. A configured
-    // location wins outright, and the round trip that asks the host about its
-    // cache directory costs seconds on a real connection.
-    let cache_home = match expandable(configured) {
-        Some(_) => None,
-        None => remote.resolve_cache_home(target)?,
+    // Only asked for when it can still change the answer and is not already
+    // known. A configured location wins outright, and asking the host about
+    // its cache directory costs seconds on a real connection.
+    let cache_home = match (expandable(configured), known_cache_home) {
+        (Some(_), _) => None,
+        (None, Some(known)) => Some(known.clone()),
+        (None, None) => remote.resolve_cache_home(target)?,
     };
     resolve(home, cache_home, configured)
 }
@@ -171,16 +186,18 @@ pub fn ensure_inbox(
     target: &TransportTarget,
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
-    ensure_inbox_from(remote, target, None, configured)
+    ensure_inbox_from(remote, target, None, None, configured)
 }
 
-/// [`ensure_inbox`], starting from a home directory that is already known.
+/// [`ensure_inbox`], starting from what is already known about the host.
 ///
-/// `setup` records the remote home with the target, and a send that starts
-/// from it does not spend a round trip asking again: on a distant host that
-/// round trip is a noticeable part of a key press. A home that has moved since
-/// `setup` shows up as the inbox failing to be created there, which running
-/// `setup` again repairs. With no known home this is exactly [`ensure_inbox`].
+/// `setup` records the remote home and cache directory with the target, and a
+/// send that starts from them does not ask again. On a distant host the home
+/// is a noticeable round trip; the cache directory is a remote command of its
+/// own, which on a client that cannot reuse connections is a whole login.
+/// Either having moved since `setup` shows up as the inbox being created in
+/// the old place, still private and still checked, which running `setup`
+/// again repairs. With neither known this is exactly [`ensure_inbox`].
 ///
 /// # Errors
 /// As [`ensure_inbox`].
@@ -188,12 +205,14 @@ pub fn ensure_inbox_from(
     remote: &dyn RemoteFs,
     target: &TransportTarget,
     known_home: Option<&RemotePath>,
+    known_cache_home: Option<&RemotePath>,
     configured: Option<&str>,
 ) -> Result<InboxLocation, CliftError> {
-    let location = match known_home {
-        Some(home) => locate_from(remote, target, home.clone(), configured)?,
-        None => locate_inbox(remote, target, configured)?,
+    let home = match known_home {
+        Some(home) => home.clone(),
+        None => remote.resolve_home(target)?,
     };
+    let location = locate_from(remote, target, home, known_cache_home, configured)?;
     remote.ensure_dir(target, location.root(), INBOX_MODE)?;
     Ok(location)
 }
@@ -220,26 +239,29 @@ fn resolve(
     if let Some(value) = expandable(configured) {
         return configured_root(&home, value);
     }
-    let (base, source) = match cache_home {
-        Some(cache) => match public_temp_root(&cache) {
-            None => (cache, InboxRootSource::CacheHome),
+    let default_cache = home.join(&component(CACHE_DIR)?);
+    let (base, source) = match &cache_home {
+        Some(cache) => match public_temp_root(cache) {
+            None => (cache.clone(), InboxRootSource::CacheHome),
             Some(root) => (
-                home.join(&component(CACHE_DIR)?),
+                default_cache.clone(),
                 InboxRootSource::CacheHomeRejected(format!(
                     "{cache} is inside {root}, which every account on the host can write to"
                 )),
             ),
         },
-        None => (
-            home.join(&component(CACHE_DIR)?),
-            InboxRootSource::HomeDefault,
-        ),
+        None => (default_cache.clone(), InboxRootSource::HomeDefault),
     };
 
     let root = base
         .join(&component(CLIFT_DIR)?)
         .join(&component(INBOX_DIR)?);
-    Ok(InboxLocation { root, home, source })
+    Ok(InboxLocation {
+        root,
+        home,
+        source,
+        cache_home: Some(cache_home.unwrap_or(default_cache)),
+    })
 }
 
 /// The public temporary directory `path` sits in, if it sits in one.
@@ -424,5 +446,65 @@ mod tests {
             })
             .count();
         assert_eq!(lookups, 2, "resolution must not re-ask the host");
+    }
+
+    /// A home and cache directory `setup` recorded are used as they are.
+    ///
+    /// The host is made to advertise somewhere else, so an answer that came
+    /// from asking would show up in the root as well as in the calls.
+    #[test]
+    fn a_recorded_home_and_cache_directory_are_not_asked_for_again() {
+        let remote = RecordingTransport::new("/home/dev");
+        remote.advertise_cache_home("/elsewhere");
+        let home = path("/home/dev");
+        let cache = path("/data/cache");
+
+        let location = ensure_inbox_from(
+            &remote,
+            &TransportTarget::new("core"),
+            Some(&home),
+            Some(&cache),
+            None,
+        )
+        .unwrap();
+        assert_eq!(location.root().as_str(), "/data/cache/clift/inbox");
+        assert!(
+            !remote.calls().iter().any(|call| matches!(
+                call,
+                crate::testing::TransportCall::ResolveHome { .. }
+                    | crate::testing::TransportCall::ResolveCacheHome { .. }
+            )),
+            "a recorded answer was asked for again: {:?}",
+            remote.calls()
+        );
+    }
+
+    /// What a location reports as its cache directory leads back to the same
+    /// root, whether the host named one, named none, or named one Clift will
+    /// not use. That is the whole of what makes it safe to record.
+    #[test]
+    fn a_recorded_cache_directory_resolves_to_the_same_root() {
+        for advertised in [None, Some(path("/data/cache")), Some(path("/tmp/cache"))] {
+            let asked = resolve(path("/home/dev"), advertised.clone(), None).unwrap();
+            let recorded = asked.cache_home().cloned();
+            assert!(recorded.is_some(), "{advertised:?}");
+            let again = resolve(path("/home/dev"), recorded, None).unwrap();
+            assert_eq!(again.root(), asked.root(), "{advertised:?}");
+            assert_eq!(again.warning(), asked.warning(), "{advertised:?}");
+        }
+        assert_eq!(
+            resolve(path("/home/dev"), None, None)
+                .unwrap()
+                .cache_home()
+                .map(RemotePath::as_str),
+            Some("/home/dev/.cache")
+        );
+        assert_eq!(
+            resolve(path("/home/dev"), None, Some("~/attachments"))
+                .unwrap()
+                .cache_home(),
+            None,
+            "a configured location never asked, so it has nothing to record"
+        );
     }
 }

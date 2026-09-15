@@ -137,6 +137,33 @@ fn paths_in(text: &str) -> Vec<String> {
     paths
 }
 
+/// Replaces the sandbox's `ssh` with one that also writes down each command
+/// line it is given, one line per run, and returns where.
+fn record_ssh(sandbox: &Sandbox, fixture: &SshdFixture) -> PathBuf {
+    let log = sandbox.work.join("ssh-calls.log");
+    let located = Command::new("/usr/bin/which")
+        .arg("ssh")
+        .output()
+        .expect("which must be runnable");
+    let real = String::from_utf8_lossy(&located.stdout).trim().to_string();
+    let path = sandbox.bin.join("ssh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec {real} -F {} \"$@\"\n",
+            log.display(),
+            fixture.ssh_config().display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    log
+}
+
 fn remote(fixture: &SshdFixture, command: &str) -> String {
     let output = fixture.ssh(command);
     String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -183,6 +210,44 @@ fn one_file_arrives_private_and_its_path_comes_back() {
         stderr_of(&output).contains("Sent 1 file"),
         "{}",
         stderr_of(&output)
+    );
+}
+
+/// A send to a host `setup` recorded starts one connection to it: its SFTP
+/// session, and no remote command besides.
+///
+/// Where connections cannot be reused, Windows among such clients, every
+/// `ssh` that connects is a login of its own, and `setup` has already asked
+/// the one question a send used to ask with a command of its own. Checked on
+/// the command lines the real `ssh` was given, so it holds whether or not this
+/// machine can multiplex.
+#[test]
+fn a_send_to_a_set_up_host_connects_only_for_its_sftp_session() {
+    if skip_without_docker("a_send_to_a_set_up_host_connects_only_for_its_sftp_session") {
+        return;
+    }
+    let fixture = SshdFixture::start(Topology::Normal);
+    let sandbox = Sandbox::new(&fixture, "one-connection");
+    let log = record_ssh(&sandbox, &fixture);
+    let source = sandbox.file("shot.png", b"the picture");
+
+    let output = sandbox.run(&["send", source.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    // `-G` prints the configuration and `-V` the version; neither connects.
+    let connecting: Vec<&str> = calls
+        .lines()
+        .filter(|line| {
+            !line
+                .split_whitespace()
+                .any(|argument| argument == "-G" || argument == "-V")
+        })
+        .collect();
+    assert_eq!(connecting.len(), 1, "ssh was run as:\n{calls}");
+    assert!(
+        connecting[0].ends_with(&format!("-s {} sftp", fixture.alias())),
+        "the one connection is not the SFTP session:\n{calls}"
     );
 }
 

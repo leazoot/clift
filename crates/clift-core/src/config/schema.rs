@@ -59,6 +59,7 @@ pub(crate) struct RawTarget {
     pub remote_dir: Option<String>,
     pub format: Option<String>,
     pub remote_home: Option<String>,
+    pub remote_cache_home: Option<String>,
     pub last_success_at: Option<String>,
 }
 
@@ -84,6 +85,7 @@ const TARGET_KEYS: &[&str] = &[
     "remote_dir",
     "format",
     "remote_home",
+    "remote_cache_home",
     "last_success_at",
 ];
 // No key here may hold a credential, and none does: a relay is not

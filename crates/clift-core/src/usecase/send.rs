@@ -92,6 +92,9 @@ pub struct SendPolicy<'a> {
     /// The remote home `setup` recorded, if it recorded one. With it the send
     /// does not ask the host again.
     pub remote_home: Option<&'a RemotePath>,
+    /// The cache directory `setup` recorded, if it recorded one. With it the
+    /// send does not ask the host again.
+    pub remote_cache_home: Option<&'a RemotePath>,
 }
 
 /// Sends one batch of attachments, from limits to insertion text.
@@ -125,6 +128,7 @@ where
         limits,
         remote_dir,
         remote_home,
+        remote_cache_home,
     } = *policy;
     // Before the first round trip, not merely before the first byte: an
     // oversized batch should not even open a connection.
@@ -137,7 +141,13 @@ where
             ))
     })?;
 
-    let inbox: InboxLocation = ensure_inbox_from(transport, target, remote_home, remote_dir)?;
+    let inbox: InboxLocation = ensure_inbox_from(
+        transport,
+        target,
+        remote_home,
+        remote_cache_home,
+        remote_dir,
+    )?;
     let plan = plan_batch(&inbox, clock, ids)?;
     let batch = stage_attachments(transport, target, &plan, limits, attachments)?;
 
@@ -537,17 +547,20 @@ mod tests {
         );
     }
 
-    /// A home `setup` already recorded is used as it is, not asked for again.
+    /// A home and cache directory `setup` already recorded are used as they
+    /// are, not asked for again.
     #[test]
     fn a_recorded_home_is_not_asked_for_again() {
         let transport = RecordingTransport::new("/home/dev");
         let home = crate::domain::RemotePath::new("/home/dev").unwrap();
+        let cache_home = crate::domain::RemotePath::new("/home/dev/.cache").unwrap();
         let outcome = perform(
             &transport,
             &TransportTarget::new("core"),
             &[attachment("a.png", 1)],
             &SendPolicy {
                 remote_home: Some(&home),
+                remote_cache_home: Some(&cache_home),
                 ..SendPolicy::default()
             },
             &FakeClock::at_unix_seconds(1_788_093_240),
@@ -560,11 +573,12 @@ mod tests {
                 .contains("/home/dev/.cache/clift/inbox/")
         );
         assert!(
-            !transport
-                .calls()
-                .iter()
-                .any(|call| matches!(call, crate::testing::TransportCall::ResolveHome { .. })),
-            "the home was asked for again: {:?}",
+            !transport.calls().iter().any(|call| matches!(
+                call,
+                crate::testing::TransportCall::ResolveHome { .. }
+                    | crate::testing::TransportCall::ResolveCacheHome { .. }
+            )),
+            "a recorded answer was asked for again: {:?}",
             transport.calls()
         );
     }

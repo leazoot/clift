@@ -125,9 +125,12 @@ where
     verify_round_trip(transport, transport, &target, location.root())?;
     steps.push(SetupStep::UploadAndCleanup);
 
-    let entry = Target::new(settings.alias(), DEFAULT_REMOTE_DIR)
+    let mut entry = Target::new(settings.alias(), DEFAULT_REMOTE_DIR)
         .with_remote_home(location.home().clone())
         .with_last_success_at(crate::calendar::format_timestamp(clock.now()));
+    if let Some(cache_home) = location.cache_home() {
+        entry = entry.with_remote_cache_home(cache_home.clone());
+    }
 
     let mut config = existing.with_target(name.clone(), entry);
     // The first host set up becomes the default. Later ones do not silently
@@ -231,8 +234,39 @@ mod tests {
             target.remote_home().map(RemotePath::as_str),
             Some("/home/dev")
         );
+        assert_eq!(
+            target.remote_cache_home().map(RemotePath::as_str),
+            Some("/home/dev/.cache"),
+            "a host that names no cache directory uses ~/.cache, and that is recorded"
+        );
         assert_eq!(target.last_success_at(), Some("2026-08-30T12:34:00Z"));
         assert_eq!(saved.default_target(), Some(&name()));
+    }
+
+    /// The cache directory the host names is recorded, so that a send does
+    /// not spend a login asking for it again.
+    #[test]
+    fn the_cache_directory_the_host_names_is_recorded() {
+        let transport = RecordingTransport::new("/home/dev");
+        transport.advertise_cache_home("/data/cache");
+        let report = prepare_target(
+            &transport,
+            settings(),
+            &Config::default(),
+            &name(),
+            &clock(),
+        )
+        .unwrap();
+
+        assert_eq!(report.inbox().as_str(), "/data/cache/clift/inbox");
+        let target = report
+            .config()
+            .target(&name())
+            .expect("the target was recorded");
+        assert_eq!(
+            target.remote_cache_home().map(RemotePath::as_str),
+            Some("/data/cache")
+        );
     }
 
     /// The self-check must not leave its own file behind.

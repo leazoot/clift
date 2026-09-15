@@ -233,6 +233,7 @@ pub struct Target {
     remote_dir: String,
     format: Option<Format>,
     remote_home: Option<RemotePath>,
+    remote_cache_home: Option<RemotePath>,
     last_success_at: Option<String>,
 }
 
@@ -242,8 +243,9 @@ pub const DEFAULT_REMOTE_DIR: &str = "~/.cache/clift/inbox";
 impl Target {
     /// A target as `setup` first learns it: an alias and where the inbox goes.
     ///
-    /// `remote_home` and `last_success_at` are filled in afterwards, because
-    /// they are things the host told Clift rather than things the user chose.
+    /// `remote_home`, `remote_cache_home` and `last_success_at` are filled in
+    /// afterwards, because they are things the host told Clift rather than
+    /// things the user chose.
     #[must_use]
     pub fn new(ssh_host: impl Into<String>, remote_dir: impl Into<String>) -> Self {
         Self {
@@ -251,6 +253,7 @@ impl Target {
             remote_dir: remote_dir.into(),
             format: None,
             remote_home: None,
+            remote_cache_home: None,
             last_success_at: None,
         }
     }
@@ -259,6 +262,14 @@ impl Target {
     #[must_use]
     pub fn with_remote_home(mut self, home: RemotePath) -> Self {
         self.remote_home = Some(home);
+        self
+    }
+
+    /// Caches the host's cache directory, saving a login of its own on every
+    /// send where connections cannot be reused.
+    #[must_use]
+    pub fn with_remote_cache_home(mut self, cache_home: RemotePath) -> Self {
+        self.remote_cache_home = Some(cache_home);
         self
     }
 
@@ -292,6 +303,16 @@ impl Target {
     #[must_use]
     pub const fn remote_home(&self) -> Option<&RemotePath> {
         self.remote_home.as_ref()
+    }
+
+    /// The host's cache directory as `setup` found it: its `XDG_CACHE_HOME`,
+    /// or `~/.cache` when it names none. Not sensitive. Asking for it is a
+    /// remote command rather than an SFTP request, so on a client that cannot
+    /// reuse connections, Windows among them, it is a login of its own; a
+    /// host that changes it later is picked up by running `setup` again.
+    #[must_use]
+    pub const fn remote_cache_home(&self) -> Option<&RemotePath> {
+        self.remote_cache_home.as_ref()
     }
 
     #[must_use]
@@ -700,11 +721,18 @@ fn build_target(name: &TargetName, raw: RawTarget) -> Result<Target, CliftError>
         .transpose()
         .map_err(config_error)?;
 
+    let remote_cache_home = raw
+        .remote_cache_home
+        .map(RemotePath::new)
+        .transpose()
+        .map_err(config_error)?;
+
     Ok(Target {
         ssh_host,
         remote_dir,
         format,
         remote_home,
+        remote_cache_home,
         last_success_at: raw.last_success_at,
     })
 }

@@ -306,6 +306,12 @@ fn render(config: &Config) -> String {
         if let Some(home) = target.remote_home() {
             out.push_str(&format!("remote_home = {}\n", toml_string(home.as_str())));
         }
+        if let Some(cache_home) = target.remote_cache_home() {
+            out.push_str(&format!(
+                "remote_cache_home = {}\n",
+                toml_string(cache_home.as_str())
+            ));
+        }
         if let Some(seen) = target.last_success_at() {
             out.push_str(&format!("last_success_at = {}\n", toml_string(seen)));
         }

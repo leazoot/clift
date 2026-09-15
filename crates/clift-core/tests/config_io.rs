@@ -57,6 +57,7 @@ format = "instruction"
 ssh_host = "core"
 remote_dir = "~/.cache/clift/inbox"
 remote_home = "/home/dev"
+remote_cache_home = "/home/dev/.cache"
 last_success_at = "2026-08-30T12:00:00Z"
 
 [targets."my host"]

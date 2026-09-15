@@ -23,9 +23,14 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   asks as before; the presses after it do neither. On a client that cannot
   reuse connections, Windows among them, each of those was a login of its own
   and together they were most of the wait.
-- A Fast Mode send no longer asks the host for its home directory when `setup`
-  already recorded it, and the occasional tidy-up of expired batches runs after
-  the text has been typed or printed rather than before.
+- A Fast Mode send no longer asks the host for its home directory or its cache
+  directory when `setup` already recorded them, and the occasional tidy-up of
+  expired batches runs after the text has been typed or printed rather than
+  before. Where connections cannot be reused, Windows among such clients, that
+  makes a send one login instead of two. `setup` now records the cache
+  directory as `remote_cache_home`; a target set up with an earlier version
+  gets it the next time `clift setup` runs for it, and works as before until
+  then.
 - `--verbose` on `send` and `paste` says how long each remote operation took.
 
 ### Fixed

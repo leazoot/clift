@@ -88,6 +88,7 @@ pub fn run(
             limits: loaded.config.defaults().limits(),
             remote_dir: Some(target.remote_dir()),
             remote_home: target.remote_home(),
+            remote_cache_home: target.remote_cache_home(),
         },
         &SystemClock,
         &SystemIdSource,

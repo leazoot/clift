@@ -167,6 +167,13 @@ fn a_successful_setup_prints_four_ticks_and_leaves_nothing_behind() {
         "{text}"
     );
     assert!(text.contains("remote_home"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "remote_cache_home = \"{}/.cache\"",
+            fixture.remote_home()
+        )),
+        "{text}"
+    );
     assert!(text.contains("last_success_at"), "{text}");
     #[cfg(unix)]
     assert_eq!(local_mode(&config), 0o600, "the config must be private");

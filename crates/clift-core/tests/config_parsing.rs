@@ -39,6 +39,10 @@ fn parses_a_full_configuration() {
     assert_eq!(core.ssh_host(), "core");
     assert_eq!(core.remote_dir(), "~/.cache/clift/inbox");
     assert_eq!(core.remote_home().unwrap().as_str(), "/home/dev");
+    assert_eq!(
+        core.remote_cache_home().unwrap().as_str(),
+        "/home/dev/.cache"
+    );
     assert_eq!(core.last_success_at(), Some("2026-08-30T12:00:00Z"));
 }
 
@@ -54,6 +58,11 @@ fn a_target_without_optional_fields_uses_the_default_inbox() {
     assert_eq!(hk.remote_dir(), config::DEFAULT_REMOTE_DIR);
     assert_eq!(hk.format(), None, "target inherits the global default");
     assert_eq!(hk.remote_home(), None);
+    assert_eq!(
+        hk.remote_cache_home(),
+        None,
+        "a target written before the field existed still loads"
+    );
 }
 
 #[test]
@@ -155,6 +164,10 @@ fn invalid_values_are_rejected_with_exit_code_20() {
         ("[targets.core]\nssh_host = \"a b\"\n", "ssh_host"),
         (
             "[targets.core]\nssh_host = \"core\"\nremote_home = \"relative/path\"\n",
+            "absolute",
+        ),
+        (
+            "[targets.core]\nssh_host = \"core\"\nremote_cache_home = \"relative/path\"\n",
             "absolute",
         ),
     ];
