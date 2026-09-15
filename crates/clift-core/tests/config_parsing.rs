@@ -8,6 +8,7 @@
 
 use clift_core::config;
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn fixture(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -147,6 +148,33 @@ fn default_target_must_reference_a_configured_target() {
     let err = config::parse(&fixture("dangling_default_target.toml")).unwrap_err();
     assert_eq!(err.exit_code().as_u8(), 20);
     assert!(err.message().contains("typo"), "{}", err.message());
+}
+
+/// A kept connection stays for an hour unless configured otherwise, and can be
+/// kept for a day at most: long enough for a working day with gaps in it, and
+/// still an end, so no `ssh` process is left waiting indefinitely.
+#[test]
+fn a_connection_is_kept_for_an_hour_by_default_and_a_day_at_most() {
+    let unconfigured = config::parse("version = 1\n").unwrap().config;
+    assert_eq!(
+        unconfigured.connection().persist(),
+        Duration::from_secs(60 * 60)
+    );
+
+    let day = config::parse("[connection]\npersist = \"24h\"\n")
+        .unwrap()
+        .config;
+    assert_eq!(
+        day.connection().persist(),
+        Duration::from_secs(24 * 60 * 60)
+    );
+
+    let err = config::parse("[connection]\npersist = \"25h\"\n")
+        .err()
+        .unwrap_or_else(|| panic!("a persist past a day was accepted"));
+    assert_eq!(err.exit_code().as_u8(), 20);
+    let chain = err.cause_chain().join(" | ");
+    assert!(chain.contains("connection.persist"), "{chain}");
 }
 
 #[test]

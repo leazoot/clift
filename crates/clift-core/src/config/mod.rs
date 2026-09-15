@@ -89,22 +89,21 @@ impl RelayConfig {
 
 /// How long an idle multiplexed SSH connection is kept before it closes.
 ///
-/// Ten minutes is the specification's default. Long enough that a session of pasting
-/// reuses one handshake throughout, short enough that a laptop closed for lunch
-/// is not still holding a socket open when it wakes.
-pub const DEFAULT_CONNECTION_PERSIST: Duration = Duration::from_secs(10 * 60);
+/// An hour. Long enough that a working session with gaps in it reuses one login
+/// throughout: on a client that cannot share a connection, a login is several
+/// seconds, and the time between two pastes is often longer than a few minutes.
+pub const DEFAULT_CONNECTION_PERSIST: Duration = Duration::from_secs(60 * 60);
 
 /// The longest Clift will keep one.
 ///
-/// A cap rather than a preference, and the reason is the same one that keeps
-/// Clift out of the background generally: a reused connection is a
-/// real `ssh` process waiting on a socket. One that outlives the working day
-/// is a daemon by another name, whatever it is called in the configuration.
-pub const MAX_CONNECTION_PERSIST: Duration = Duration::from_secs(60 * 60);
+/// A cap rather than a preference: a kept connection is a real `ssh` process
+/// waiting on a socket. A day covers a working day and the night after it, and
+/// is still an end, so a connection nobody uses is not kept indefinitely.
+pub const MAX_CONNECTION_PERSIST: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Connection reuse: the specification's half of the configuration.
 ///
-/// Absent from a file means the defaults, which is reuse on at ten minutes.
+/// Absent from a file means the defaults, which is reuse on at an hour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Connection {
     reuse: bool,
@@ -141,8 +140,8 @@ impl Connection {
             return Err(config_error(DomainError::new(
                 "connection.persist",
                 format!(
-                    "longer than the {} minute maximum",
-                    MAX_CONNECTION_PERSIST.as_secs() / 60
+                    "longer than the {} hour maximum",
+                    MAX_CONNECTION_PERSIST.as_secs() / 3600
                 ),
             )));
         }

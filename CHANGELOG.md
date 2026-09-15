@@ -17,7 +17,7 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clients that cannot reuse connections, and the `sftp` program is no longer
   needed. `doctor` drops its "sftp client" check and reports twelve.
 - The hotkey helper keeps its SSH connection open between presses, for up to
-  `connection.persist` (ten minutes unless configured), and checks now and
+  `connection.persist` (an hour unless configured), and checks now and
   then that it is still alive. It also remembers, for as long, where the host
   keeps its caches. The first Fast Mode press after a quiet spell connects and
   asks as before; the presses after it do neither. On a client that cannot
@@ -37,6 +37,10 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more on every press. The checks themselves are unchanged, and a batch
   directory created next to an inbox that fails its check is removed again.
 - `--verbose` on `send` and `paste` says how long each remote operation took.
+- `connection.persist` defaults to an hour instead of ten minutes, and can be
+  set to at most a day instead of an hour. Restart the hotkey helper after
+  changing it: `clift hotkey --install` stops the running one and starts a new
+  one.
 
 ### Fixed
 
