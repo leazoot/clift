@@ -12,6 +12,10 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Clipboard,
+    /// Reading a file the user named or copied: missing, unreadable, or not
+    /// something that can be sent. Kept apart from `Clipboard`, because a file
+    /// named on the command line never went near the clipboard.
+    Attachment,
     TargetResolution,
     Connect,
     Transfer,
@@ -33,8 +37,9 @@ pub enum Stage {
 impl Stage {
     /// Every stage in declaration order. Tests iterate this instead of
     /// re-listing the variants, so a new stage cannot be silently untested.
-    pub const ALL: [Stage; 10] = [
+    pub const ALL: [Stage; 11] = [
         Stage::Clipboard,
+        Stage::Attachment,
         Stage::TargetResolution,
         Stage::Connect,
         Stage::Transfer,
@@ -50,6 +55,7 @@ impl Stage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Stage::Clipboard => "clipboard",
+            Stage::Attachment => "attachment",
             Stage::TargetResolution => "target resolution",
             Stage::Connect => "connect",
             Stage::Transfer => "transfer",

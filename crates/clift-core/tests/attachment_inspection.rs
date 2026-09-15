@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use clift_core::attachments::{inspect, inspect_all};
+use clift_core::error::Stage;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -176,10 +177,14 @@ fn a_dangling_symlink_is_refused_with_a_way_to_look() {
     );
 }
 
+/// A missing file is called missing rather than a clipboard failure: a path
+/// typed on the command line never went near the clipboard.
 #[test]
 fn a_path_that_does_not_exist_is_refused() {
     let error = inspect(Path::new("/nonexistent/never/was")).expect_err("nothing is there");
     assert_eq!(error.exit_code().as_u8(), 24);
+    assert_eq!(error.stage(), Stage::Attachment, "{error}");
+    assert!(error.to_string().contains("does not exist"), "{error}");
 }
 
 /// A set is accepted whole or not at all: a partially accepted selection is a

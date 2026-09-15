@@ -120,7 +120,7 @@ fn bundle_entries(
         };
         let data = std::fs::read(attachment.path()).map_err(|error| {
             CliftError::new(
-                Stage::Clipboard,
+                Stage::Attachment,
                 ErrorKind::ClipboardRead,
                 format!("cannot read {}", attachment.path().display()),
             )

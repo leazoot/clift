@@ -354,7 +354,16 @@ fn a_missing_file_is_refused_before_the_host_is_touched() {
     let good = sandbox.file("here.txt", b"x");
 
     let output = sandbox.run(&["send", good.to_str().unwrap(), "/nonexistent/never/was.png"]);
-    assert_eq!(output.status.code(), Some(24), "{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(24), "{stderr}");
+    assert!(
+        stderr.contains("/nonexistent/never/was.png does not exist"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("clipboard"),
+        "a file named on the command line never went near the clipboard: {stderr}"
+    );
     assert!(
         output.stdout.is_empty(),
         "a failure must leave stdout empty"

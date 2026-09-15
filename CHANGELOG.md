@@ -53,6 +53,10 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A request still waiting for the server when the time limit ran out could be
   sent again, so a `rename` could happen twice. A request that has been sent is
   now reported as failed and never repeated.
+- `clift send` with a file that is not there said the clipboard had failed,
+  and suggested `ls -l`, which PowerShell does not have. It now says the file
+  does not exist, and on Windows the commands it offers for looking at a file
+  or archiving a folder are ones PowerShell runs.
 
 ### Security
 

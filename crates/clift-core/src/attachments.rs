@@ -18,7 +18,10 @@
 
 use crate::domain::{FileKind, LocalAttachment, SafeFileName};
 use crate::error::{CliftError, ErrorKind, Remedy, Stage};
+use crate::format::instruction::quote;
+use crate::places::Platform;
 use std::fs::Metadata;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Inspects one local path.
@@ -31,39 +34,19 @@ pub fn inspect(path: &Path) -> Result<LocalAttachment, CliftError> {
     // Follows links and makes the path absolute in one step. A relative path
     // would be resolved against whatever directory the process happens to be
     // in, which is not necessarily the one the user meant.
-    let resolved = path.canonicalize().map_err(|error| {
-        CliftError::new(
-            Stage::Clipboard,
-            ErrorKind::ClipboardRead,
-            format!("cannot read {}", path.display()),
-        )
-        .with_source(error)
-        .with_remedy(Remedy::new(
-            "Check that the file is there and readable:",
-            format!("ls -l {}", path.display()),
-        ))
-    })?;
-
-    let metadata = std::fs::metadata(&resolved).map_err(|error| {
-        CliftError::new(
-            Stage::Clipboard,
-            ErrorKind::ClipboardRead,
-            format!("cannot read {}", path.display()),
-        )
-        .with_source(error)
-    })?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|error| unreadable(path, error))?;
+    let metadata = std::fs::metadata(&resolved).map_err(|error| unreadable(path, error))?;
 
     let kind = classify(&metadata);
     if kind == FileKind::Directory {
         return Err(CliftError::new(
-            Stage::Clipboard,
+            Stage::Attachment,
             ErrorKind::ClipboardRead,
             format!("{} is a folder, and folders cannot be sent", display(path)),
         )
-        .with_remedy(Remedy::new(
-            "Make an archive of it and send that:",
-            format!("zip -r {}.zip {}", display(path), display(path)),
-        )));
+        .with_remedy(archive(path, Platform::current())));
     }
 
     // The link's own name rather than the target's: it is the one the user was
@@ -72,14 +55,14 @@ pub fn inspect(path: &Path) -> Result<LocalAttachment, CliftError> {
         .or_else(|| file_name(&resolved))
         .ok_or_else(|| {
             CliftError::new(
-                Stage::Clipboard,
+                Stage::Attachment,
                 ErrorKind::ClipboardRead,
                 format!("{} has no file name", path.display()),
             )
         })?;
 
     LocalAttachment::new(resolved, name, metadata.len(), kind)
-        .map_err(|error| error.into_clift(Stage::Clipboard, ErrorKind::ClipboardRead))
+        .map_err(|error| error.into_clift(Stage::Attachment, ErrorKind::ClipboardRead))
 }
 
 /// Inspects every path, refusing the whole set if any one of them fails.
@@ -101,6 +84,52 @@ fn file_name(path: &Path) -> Option<SafeFileName> {
 
 fn display(path: &Path) -> String {
     path.display().to_string()
+}
+
+/// A path that cannot be opened. A missing file is the common case, from a
+/// mistyped name, and is called what it is.
+fn unreadable(path: &Path, error: io::Error) -> CliftError {
+    let message = if error.kind() == io::ErrorKind::NotFound {
+        format!("{} does not exist", path.display())
+    } else {
+        format!("cannot read {}", path.display())
+    };
+    CliftError::new(Stage::Attachment, ErrorKind::ClipboardRead, message)
+        .with_source(error)
+        .with_remedy(look_at(path, Platform::current()))
+}
+
+/// A command that shows what is at `path`, in the shell the user has.
+///
+/// On Windows that shell is PowerShell, where `ls -l` does not run.
+fn look_at(path: &Path, platform: Platform) -> Remedy {
+    let path = display(path);
+    let command = match platform {
+        Platform::Unix => format!("ls -l {}", quote(&path)),
+        Platform::Windows => format!("Get-Item -LiteralPath {}", powershell_quote(&path)),
+    };
+    Remedy::new("Check that the file is there and readable:", command)
+}
+
+/// A command that archives the folder at `path` next to it.
+fn archive(path: &Path, platform: Platform) -> Remedy {
+    let folder = display(path);
+    let zip = format!("{folder}.zip");
+    let command = match platform {
+        Platform::Unix => format!("zip -r {} {}", quote(&zip), quote(&folder)),
+        Platform::Windows => format!(
+            "Compress-Archive -LiteralPath {} -DestinationPath {}",
+            powershell_quote(&folder),
+            powershell_quote(&zip)
+        ),
+    };
+    Remedy::new("Make an archive of it and send that:", command)
+}
+
+/// Single quotes, the one PowerShell quoting that expands nothing, with a quote
+/// inside written twice.
+fn powershell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }
 
 #[cfg(unix)]
@@ -134,5 +163,35 @@ fn classify(metadata: &Metadata) -> FileKind {
         FileKind::Directory
     } else {
         FileKind::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The offered command has to run where the user is: `ls` and `zip` are
+    /// not PowerShell commands, and a Windows path is not a POSIX word.
+    #[test]
+    fn the_commands_offered_run_in_the_shell_of_the_platform() {
+        let windows = Path::new(r"D:\shots\it's here.png");
+        assert_eq!(
+            look_at(windows, Platform::Windows).command(),
+            r"Get-Item -LiteralPath 'D:\shots\it''s here.png'"
+        );
+        assert_eq!(
+            archive(windows, Platform::Windows).command(),
+            r"Compress-Archive -LiteralPath 'D:\shots\it''s here.png' -DestinationPath 'D:\shots\it''s here.png.zip'"
+        );
+
+        let unix = Path::new("/home/dev/it's here");
+        assert_eq!(
+            look_at(unix, Platform::Unix).command(),
+            r"ls -l '/home/dev/it'\''s here'"
+        );
+        assert_eq!(
+            archive(unix, Platform::Unix).command(),
+            r"zip -r '/home/dev/it'\''s here.zip' '/home/dev/it'\''s here'"
+        );
     }
 }
