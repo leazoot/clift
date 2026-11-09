@@ -194,7 +194,7 @@ jobs:
       # it is used, and v3 looks for a detached `.sig` that cosign 3.x releases
       # no longer publish (they ship `.sigstore.json` bundles, which v4 reads).
       # Pinned to a full version: the installer publishes no `v4` major tag.
-      - uses: sigstore/cosign-installer@v4.1.2
+      - uses: sigstore/cosign-installer@v4.1.3
         with:
           cosign-release: v3.1.3
 
